@@ -1,4 +1,6 @@
-const NIA_API = "https://api.nia.ai/v1";
+// Nia v2 API client. Base URL and endpoints differ from the legacy /v1 API
+// — see https://apigcp.trynia.ai/v2 (the previous api.nia.ai/v1 is dead).
+const NIA_API = "https://apigcp.trynia.ai/v2";
 
 function headers() {
   return {
@@ -7,29 +9,53 @@ function headers() {
   };
 }
 
-export async function indexRepo(repoUrl: string): Promise<string> {
-  const res = await fetch(`${NIA_API}/indexes`, {
+/**
+ * Index a GitHub repo with Nia. Accepts either an owner/repo slug
+ * (e.g. "stananan/blewIt") or a full https://github.com/... URL — the
+ * latter is parsed to a slug.
+ *
+ * Returns the slug, which is what Nia's search endpoint expects in
+ * its `repositories` field.
+ */
+export async function indexRepo(repoUrlOrSlug: string): Promise<string> {
+  const slug = repoUrlOrSlug.startsWith("http")
+    ? repoUrlOrSlug.replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, "").replace(/\/$/, "")
+    : repoUrlOrSlug;
+
+  const res = await fetch(`${NIA_API}/sources`, {
     method: "POST",
     headers: headers(),
-    body: JSON.stringify({ url: repoUrl }),
+    body: JSON.stringify({ type: "repository", repository: slug }),
   });
   if (!res.ok) throw new Error(`Nia indexRepo failed: ${res.status} ${await res.text()}`);
-  const data = await res.json();
-  return data.id ?? data.indexId ?? data.index_id;
+  // We return the slug rather than the source ID — search is keyed by slug.
+  return slug;
 }
 
-export async function pollIndexStatus(indexId: string, timeoutMs = 90_000): Promise<void> {
+/**
+ * Poll Nia until the source is indexed. Looks up by slug via list-sources,
+ * since /v2/search references repos by slug.
+ */
+export async function pollIndexStatus(slug: string, timeoutMs = 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const res = await fetch(`${NIA_API}/indexes/${indexId}`, { headers: headers() });
-    if (!res.ok) throw new Error(`Nia status check failed: ${res.status}`);
-    const data = await res.json();
-    const status: string = data.status ?? data.state ?? "";
-    if (status === "ready" || status === "complete" || status === "completed") return;
-    if (status === "error" || status === "failed") throw new Error(`Nia indexing failed: ${JSON.stringify(data)}`);
+    const res = await fetch(`${NIA_API}/sources?type=repository`, { headers: headers() });
+    if (res.ok) {
+      const data = await res.json();
+      const items: Array<{ identifier?: string; status?: string }> =
+        data.items ?? data.sources ?? data ?? [];
+      const match = items.find((s) => s.identifier === slug);
+      if (match) {
+        const status = (match.status ?? "").toLowerCase();
+        if (["indexed", "ready", "completed", "complete"].includes(status)) return;
+        if (["error", "failed"].includes(status)) {
+          throw new Error(`Nia indexing failed for ${slug}: ${status}`);
+        }
+      }
+    }
     await new Promise((r) => setTimeout(r, 3000));
   }
-  throw new Error(`Nia index ${indexId} timed out after ${timeoutMs}ms`);
+  // Don't throw on timeout — search may still work with partial index
 }
 
 export interface NiaSnippet {
@@ -38,18 +64,35 @@ export interface NiaSnippet {
   score: number;
 }
 
-export async function queryNia(indexId: string, query: string, topK = 5): Promise<NiaSnippet[]> {
-  const res = await fetch(`${NIA_API}/indexes/${indexId}/query`, {
+/**
+ * Query Nia's unified search scoped to one repository (by slug).
+ * Returns a synthesized answer + cited file paths — Nia's v2 API
+ * does not return raw chunks the way the v1 API did.
+ */
+export async function queryNia(slug: string, query: string): Promise<NiaSnippet[]> {
+  const res = await fetch(`${NIA_API}/search`, {
     method: "POST",
     headers: headers(),
-    body: JSON.stringify({ query, top_k: topK }),
+    body: JSON.stringify({
+      mode: "query",
+      messages: [{ role: "user", content: query }],
+      repositories: [slug],
+      include_sources: true,
+      fast_mode: true,
+    }),
   });
   if (!res.ok) throw new Error(`Nia query failed: ${res.status} ${await res.text()}`);
   const data = await res.json();
-  const results = data.results ?? data.snippets ?? data.chunks ?? [];
-  return results.map((r: { content?: string; text?: string; file_path?: string; filePath?: string; path?: string; score?: number; similarity?: number }) => ({
-    content: r.content ?? r.text ?? "",
-    filePath: r.file_path ?? r.filePath ?? r.path ?? "",
-    score: r.score ?? r.similarity ?? 0,
-  }));
+  const answer: string = data.content ?? "";
+  const sources: string[] = data.sources ?? [];
+
+  // Adapt the v2 answer-shape into the snippet[] shape callers expect.
+  // We pack the synthesized answer as the first "snippet" and each citation
+  // as a follow-up entry, so existing display logic still works.
+  const snippets: NiaSnippet[] = [];
+  if (answer) snippets.push({ content: answer, filePath: `${slug} (Nia synthesis)`, score: 1.0 });
+  for (const cite of sources.slice(0, 5)) {
+    snippets.push({ content: `Cited file: ${cite}`, filePath: cite, score: 0.8 });
+  }
+  return snippets;
 }

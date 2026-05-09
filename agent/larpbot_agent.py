@@ -407,7 +407,7 @@ def extract_claims_from_email(email_body: str, resume_text: str) -> dict:
 # Step 4: Index top repos with Nia
 # ---------------------------------------------------------------------------
 
-NIA_API = "https://api.nia.ai/v1"
+NIA_API = "https://apigcp.trynia.ai/v2"
 
 
 def _nia_headers() -> dict:
@@ -421,7 +421,11 @@ def _nia_headers() -> dict:
     timeout=300,
 )
 def index_github_repos(github_username: str) -> dict[str, str]:
-    """Returns {repo_name: nia_index_id} for up to 3 repos."""
+    """Returns {repo_name: 'owner/repo'} for up to 3 indexed repos.
+
+    Nia v2 references repos by their `owner/repo` slug, not by an opaque ID.
+    The slug is what's passed to /v2/search via the `repositories` field.
+    """
     gh_headers = {
         "Authorization": f"Bearer {os.environ['GITHUB_PAT']}",
         "Accept": "application/vnd.github+json",
@@ -439,43 +443,53 @@ def index_github_repos(github_username: str) -> dict[str, str]:
     repos.sort(key=lambda r: (-r["stargazers_count"],))
     repos = repos[:3]
 
-    index_ids: dict[str, str] = {}
+    # repo_name -> "owner/repo" slug (used by Nia search later)
+    indexed: dict[str, str] = {}
+    pending_ids: dict[str, str] = {}  # source_id -> repo_name (for polling)
+
     for repo in repos:
-        clone_url = repo["clone_url"]
+        slug = repo["full_name"]  # "owner/repo"
         try:
-            r = requests.post(NIA_API + "/indexes", headers=_nia_headers(), json={"url": clone_url}, timeout=10)
+            r = requests.post(
+                f"{NIA_API}/sources",
+                headers=_nia_headers(),
+                json={"type": "repository", "repository": slug},
+                timeout=15,
+            )
             if not r.ok:
                 continue
-            index_id = r.json().get("id") or r.json().get("indexId") or r.json().get("index_id")
-            if not index_id:
-                continue
-            index_ids[repo["name"]] = index_id
+            data = r.json()
+            source_id = data.get("id")
+            status = data.get("status", "")
+            indexed[repo["name"]] = slug
+            if status not in ("indexed", "ready", "completed", "complete"):
+                pending_ids[source_id] = repo["name"]
         except Exception as e:
             print(f"Nia index failed for {repo['name']}: {e}")
             continue
 
-    if not index_ids:
-        return {}
+    if not pending_ids:
+        return indexed
 
-    # Poll until all ready (max 90s)
-    deadline = time.time() + 90
-    pending = set(index_ids.values())
-    while pending and time.time() < deadline:
+    # Poll until all ready (max 60s — typical small-repo indexing is ~5-15s)
+    deadline = time.time() + 60
+    while pending_ids and time.time() < deadline:
         time.sleep(3)
-        done = set()
-        for idx_id in list(pending):
+        done = []
+        for sid in list(pending_ids.keys()):
             try:
-                sr = requests.get(f"{NIA_API}/indexes/{idx_id}", headers=_nia_headers(), timeout=10)
+                sr = requests.get(f"{NIA_API}/sources/{sid}", headers=_nia_headers(), timeout=10)
                 if not sr.ok:
                     continue
-                status = sr.json().get("status") or sr.json().get("state") or ""
-                if status in ("ready", "complete", "completed", "error", "failed"):
-                    done.add(idx_id)
+                status = (sr.json().get("status") or "").lower()
+                if status in ("indexed", "ready", "completed", "complete", "error", "failed"):
+                    done.append(sid)
             except Exception:
-                done.add(idx_id)
-        pending -= done
+                done.append(sid)
+        for sid in done:
+            pending_ids.pop(sid, None)
 
-    return index_ids
+    return indexed
 
 
 # ---------------------------------------------------------------------------
@@ -531,27 +545,34 @@ def _fix_receipt_urls(
     return fixed
 
 
-def _nia_query(index_id: str, query: str, top_k: int = 5) -> list[dict]:
+def _nia_query(repo_slug: str, query: str) -> dict:
+    """
+    Query Nia's unified search scoped to one repository.
+    Returns {"answer": str, "citations": [str]} where citations are file paths
+    (e.g. "owner/repo/path/file.ext") that Nia found relevant.
+    """
     try:
         r = requests.post(
-            f"{NIA_API}/indexes/{index_id}/query",
+            f"{NIA_API}/search",
             headers=_nia_headers(),
-            json={"query": query, "top_k": top_k},
-            timeout=10,
+            json={
+                "mode": "query",
+                "messages": [{"role": "user", "content": query}],
+                "repositories": [repo_slug],
+                "include_sources": True,
+                "fast_mode": True,
+            },
+            timeout=30,
         )
-    except Exception:
-        return []
+    except Exception as e:
+        return {"answer": f"(Nia request failed: {e})", "citations": []}
     if not r.ok:
-        return []
+        return {"answer": f"(Nia returned {r.status_code})", "citations": []}
     data = r.json()
-    results = data.get("results") or data.get("snippets") or data.get("chunks") or []
-    return [
-        {
-            "content": s.get("content") or s.get("text") or "",
-            "filePath": s.get("file_path") or s.get("filePath") or s.get("path") or "",
-        }
-        for s in results
-    ]
+    return {
+        "answer": data.get("content") or "",
+        "citations": data.get("sources") or [],
+    }
 
 
 @function(
@@ -833,11 +854,13 @@ def _run_tool(name: str, inp: dict, index_ids: dict, username: str, repos: list)
         html_url = f"https://github.com/{full_name}"
 
         if name == "nia_search":
-            index_id = index_ids.get(repo_name)
-            if not index_id:
+            slug = index_ids.get(repo_name) or full_name
+            if not slug:
                 return f"No Nia index for {repo_name}"
-            snippets = _nia_query(index_id, inp.get("query", ""))
-            return "\n\n---\n\n".join(f"{s['filePath']}\n{s['content']}" for s in snippets) or "(no results)"
+            result = _nia_query(slug, inp.get("query", ""))
+            answer = result["answer"] or "(no answer)"
+            cites = "\n".join(f"  - https://github.com/{c}" for c in result["citations"][:6])
+            return f"{answer}\n\nCitations:\n{cites}" if cites else answer
 
         elif name == "github_commits":
             r = requests.get(
