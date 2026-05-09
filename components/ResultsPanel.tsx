@@ -52,25 +52,31 @@ function ClaimCard({ claim, index }: { claim: ClaimVerification; index: number }
           <p className="text-xs text-zinc-400 leading-relaxed">{claim.evidence}</p>
         </div>
         {claim.receipts.length > 0 && (
-          <div className="space-y-1">
+          <div className="space-y-2">
             <p className="text-xs text-zinc-500 uppercase tracking-widest">Receipts</p>
             {claim.receipts.map((r, i) => (
-              <a
-                key={i}
-                href={r.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-start gap-2 text-xs text-zinc-400 hover:text-zinc-200 transition-colors group"
-              >
-                <span className="text-zinc-600 shrink-0 mt-0.5">
-                  {r.type === "commit" ? "●" : r.type === "file" ? "◆" : r.type === "pattern" ? "▲" : "■"}
-                </span>
-                <span>
-                  <span className="font-medium text-zinc-300 group-hover:text-white">{r.label}</span>
-                  {" — "}
-                  {r.detail}
-                </span>
-              </a>
+              <div key={i} className="space-y-1">
+                <a
+                  href={r.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-start gap-2 text-xs text-zinc-400 hover:text-zinc-200 transition-colors group"
+                >
+                  <span className="text-zinc-600 shrink-0 mt-0.5">
+                    {r.type === "commit" ? "●" : r.type === "file" ? "◆" : r.type === "pattern" ? "▲" : "■"}
+                  </span>
+                  <span>
+                    <span className="font-medium text-zinc-300 group-hover:text-white">{r.label}</span>
+                    {" — "}
+                    {r.detail}
+                  </span>
+                </a>
+                {r.snippet && (
+                  <pre className="ml-5 mt-1 px-3 py-2 bg-black border border-zinc-800 rounded text-[11px] text-zinc-300 font-mono whitespace-pre-wrap leading-relaxed overflow-x-auto">
+                    {r.snippet.length > 400 ? r.snippet.slice(0, 400) + "…" : r.snippet}
+                  </pre>
+                )}
+              </div>
             ))}
           </div>
         )}
@@ -167,6 +173,9 @@ export default function ResultsPanel({
         </div>
       </div>
 
+      {/* Ask the codebase */}
+      <AskCodebase username={result.candidate} repos={result.analyzedRepos} />
+
       {/* Claims */}
       <div className="space-y-4">
         <p className="text-xs text-zinc-500 uppercase tracking-widest">
@@ -180,6 +189,117 @@ export default function ResultsPanel({
           )
         )}
       </div>
+    </div>
+  );
+}
+
+interface AskAnswer {
+  repo: string;
+  slug: string;
+  answer: string;
+  citations: string[];
+}
+
+function AskCodebase({ username, repos }: { username: string; repos: string[] }) {
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [answers, setAnswers] = useState<AskAnswer[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit() {
+    if (!query.trim() || loading) return;
+    setLoading(true);
+    setError(null);
+    setAnswers(null);
+    try {
+      const res = await fetch("/api/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, repos, query }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setAnswers(data.perRepo as AskAnswer[]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "request failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="bg-zinc-900 border border-indigo-900/40 rounded p-5 space-y-3">
+      <div className="flex items-center justify-between">
+        <p className="text-xs text-indigo-300 uppercase tracking-widest">
+          Ask the codebase
+        </p>
+        <span className="text-[10px] text-zinc-500">powered by Nia</span>
+      </div>
+      <p className="text-xs text-zinc-500">
+        Their {repos.length} top {repos.length === 1 ? "repo is" : "repos are"} indexed.
+        Ask anything — semantic search across the actual code.
+      </p>
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          placeholder="e.g. Did they write tests? Is the auth real?"
+          className="flex-1 bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:border-indigo-600 focus:outline-none"
+          disabled={loading}
+        />
+        <button
+          onClick={submit}
+          disabled={loading || !query.trim()}
+          className="bg-indigo-600 hover:bg-indigo-500 disabled:bg-zinc-800 disabled:text-zinc-600 text-white text-sm px-4 py-2 rounded transition-colors"
+        >
+          {loading ? "Asking…" : "Ask"}
+        </button>
+      </div>
+      {error && <p className="text-xs text-red-400">Error: {error}</p>}
+      {answers && (
+        <div className="space-y-3 pt-2">
+          {answers.map((a) => (
+            <div key={a.repo} className="border-t border-zinc-800 pt-3">
+              <div className="flex items-center justify-between mb-1">
+                <a
+                  href={`https://github.com/${a.slug}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-xs font-mono text-zinc-300 hover:text-white"
+                >
+                  {a.slug}
+                </a>
+                {a.citations.length > 0 && (
+                  <span className="text-[10px] text-zinc-600">
+                    {a.citations.length} {a.citations.length === 1 ? "citation" : "citations"}
+                  </span>
+                )}
+              </div>
+              <p className="text-sm text-zinc-300 whitespace-pre-wrap leading-relaxed">
+                {a.answer}
+              </p>
+              {a.citations.length > 0 && (
+                <ul className="mt-2 space-y-0.5">
+                  {a.citations.slice(0, 5).map((c, i) => (
+                    <li key={i} className="text-[11px]">
+                      <a
+                        href={`https://github.com/${c}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-indigo-400 hover:text-indigo-300 font-mono"
+                      >
+                        {c}
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

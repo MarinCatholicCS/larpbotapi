@@ -3,6 +3,8 @@ export interface Receipt {
   label: string;
   detail: string;
   url: string;
+  /** Optional 1-3 line excerpt from the actual file/commit. Renders in the UI under the link. */
+  snippet?: string;
 }
 
 export interface ClaimVerification {

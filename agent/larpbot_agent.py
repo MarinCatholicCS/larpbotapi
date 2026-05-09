@@ -414,17 +414,74 @@ def _nia_headers() -> dict:
     return {"Authorization": f"Bearer {os.environ['NIA_API_KEY']}", "Content-Type": "application/json"}
 
 
+def _select_relevant_repos(username: str, pool: list[dict], claims: list[str]) -> list[dict]:
+    """
+    Use GPT to pick 3-5 repos from `pool` most relevant for verifying `claims`.
+    Filters out tutorial/follow-along repos, GitHub Pages sites, and empty repos
+    in favor of substantive code.
+
+    Falls back to top 3 by stars if the LLM call fails.
+    """
+    from openai import OpenAI
+
+    catalog = "\n".join(
+        f"- {r['name']}: lang={r.get('language') or 'unknown'}, "
+        f"size={r.get('size', 0)}KB, stars={r.get('stargazers_count', 0)}, "
+        f"pushed={(r.get('pushed_at') or '')[:10]}, "
+        f"desc={(r.get('description') or '')[:80]}"
+        for r in pool
+    )
+    claims_str = "\n".join(f"- {c}" for c in claims)
+
+    try:
+        client = OpenAI()
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=256,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Pick the 3 to 5 GitHub repos from this candidate's list that best "
+                    f"let us verify the following claims. Prefer repos with substantive "
+                    f"code over tutorial follow-alongs (like 'rust-book', '100-days-of-x'), "
+                    f"empty placeholders, and personal-site repos (e.g. {username}.github.io). "
+                    f"Return ONLY a JSON array of repo names, no markdown.\n\n"
+                    f"CLAIMS:\n{claims_str}\n\n"
+                    f"REPOS:\n{catalog}\n\n"
+                    f'Output: ["repo1","repo2","repo3"]'
+                ),
+            }],
+        )
+        text = _strip_json(resp.choices[0].message.content.strip())
+        chosen_names = json.loads(text)
+        if not isinstance(chosen_names, list):
+            raise ValueError("not a list")
+        # Map names back to repo objects, preserving model order
+        by_name = {r["name"]: r for r in pool}
+        selected = [by_name[n] for n in chosen_names if n in by_name][:5]
+        return selected if selected else _fallback_top(pool)
+    except Exception as e:
+        print(f"Repo selection LLM failed: {e}; falling back to stars")
+        return _fallback_top(pool)
+
+
+def _fallback_top(pool: list[dict]) -> list[dict]:
+    sorted_pool = sorted(pool, key=lambda r: (-r.get("stargazers_count", 0),))
+    return sorted_pool[:3]
+
+
 @function(
-    description="Fetch top GitHub repos and index them with Nia",
+    description="Fetch top GitHub repos and index them with Nia, picking the most relevant for the claims",
     image=AGENT_IMAGE,
-    secrets=["GITHUB_PAT", "NIA_API_KEY"],
+    secrets=["GITHUB_PAT", "NIA_API_KEY", "OPENAI_API_KEY"],
     timeout=300,
 )
-def index_github_repos(github_username: str) -> dict[str, str]:
-    """Returns {repo_name: 'owner/repo'} for up to 3 indexed repos.
+def index_github_repos(github_username: str, claims: Optional[list[str]] = None) -> dict[str, str]:
+    """Returns {repo_name: 'owner/repo'} for up to 5 indexed repos.
 
-    Nia v2 references repos by their `owner/repo` slug, not by an opaque ID.
-    The slug is what's passed to /v2/search via the `repositories` field.
+    If `claims` are provided, asks GPT to pick the 3-5 most relevant repos from
+    the top 10 candidates (skips GitHub Pages sites, tutorial-looking repos).
+    Otherwise falls back to top 3 by recency.
     """
     gh_headers = {
         "Authorization": f"Bearer {os.environ['GITHUB_PAT']}",
@@ -439,9 +496,19 @@ def index_github_repos(github_username: str) -> dict[str, str]:
         # Don't raise — sub-function exceptions get swallowed by Tensorlake.
         # The caller pre-validates the user via github_user_exists().
         return {}
-    repos = [r for r in resp.json() if not r["fork"]]
-    repos.sort(key=lambda r: (-r["stargazers_count"],))
-    repos = repos[:3]
+    all_repos = [r for r in resp.json() if not r["fork"]]
+    if not all_repos:
+        return {}
+
+    # Take top 10 by recency as the candidate pool
+    pool = all_repos[:10]
+
+    if claims and len(pool) > 3:
+        repos = _select_relevant_repos(github_username, pool, claims)
+    else:
+        # No claims to anchor selection — use stars desc, fallback recency
+        pool.sort(key=lambda r: (-r.get("stargazers_count", 0),))
+        repos = pool[:3]
 
     # repo_name -> "owner/repo" slug (used by Nia search later)
     indexed: dict[str, str] = {}
@@ -680,6 +747,10 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
                                     "label": {"type": "string"},
                                     "detail": {"type": "string"},
                                     "url": {"type": "string"},
+                                    "snippet": {
+                                        "type": "string",
+                                        "description": "1-3 line excerpt from the actual file/commit message that supports this receipt. Quote real code or commit text — do not paraphrase. Optional but strongly preferred when you read a file or fetched commits.",
+                                    },
                                 },
                                 "required": ["type", "label", "detail", "url"],
                             },
@@ -703,6 +774,10 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
         f"{repo_url_lines}\n\n"
         "When you submit_verdict, every receipt MUST have a fully-qualified GitHub URL "
         f"like https://github.com/{github_username}/<repo>/... — never just /repo or a bare path.\n"
+        "For each receipt where you read a file or fetched commits, include a `snippet` "
+        "field: 1-3 lines of the actual code or commit message text that supports the "
+        "receipt. Quote literally — do not paraphrase. The recruiter will see this snippet "
+        "rendered next to the link.\n"
         f"Investigate each claim, gather evidence, then call submit_verdict. "
         f"Be efficient — cap tool use at {MAX_TOOL_CALLS} calls per claim."
     )
@@ -942,10 +1017,24 @@ def send_verdict_email(
     references: Optional[str] = None,
     original_subject: Optional[str] = None,
 ) -> None:
+    def _esc(s: str) -> str:
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     top_receipts = []
     for cv in verdict.get("claims", []):
         for r in cv.get("receipts", [])[:1]:
-            top_receipts.append(f'<li><a href="{r["url"]}">{r["label"]}</a> — {r["detail"]}</li>')
+            snippet = r.get("snippet", "")
+            snippet_html = (
+                f'<pre style="margin:6px 0 0;padding:8px 10px;background:#0a0a0a;'
+                f'border:1px solid #27272a;border-radius:4px;color:#d4d4d8;'
+                f'font-size:11px;line-height:1.5;white-space:pre-wrap;'
+                f'overflow-x:auto;font-family:monospace">{_esc(snippet)[:400]}</pre>'
+            ) if snippet else ""
+            top_receipts.append(
+                f'<li style="margin-bottom:10px"><a href="{r["url"]}" style="color:#d4d4d8">'
+                f'{_esc(r["label"])}</a> <span style="color:#71717a">— {_esc(r["detail"])}</span>'
+                f'{snippet_html}</li>'
+            )
         if len(top_receipts) >= 3:
             break
 
@@ -1230,7 +1319,7 @@ def poll_recruiting_inbox() -> dict:
                     f"engineering experience and code substance"
                 ]
 
-            index_ids = index_github_repos(github_username)
+            index_ids = index_github_repos(github_username, claims)
             verdict = verify_claims(github_username, claims, index_ids)
 
             memory_store_candidate(github_username, verdict)
