@@ -676,12 +676,19 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
             "type": "function",
             "function": {
                 "name": "nia_search",
-                "description": "Search the indexed codebase for relevant code snippets",
+                "description": (
+                    "PREFERRED tool for any 'is X real / does this codebase do Y' question. "
+                    "Runs semantic search across the FULL indexed repo (every file) and returns "
+                    "a synthesized answer with file citations. Use this BEFORE github_tree or "
+                    "github_file for questions like: 'is there real auth?', 'how is data persisted?', "
+                    "'is testing comprehensive?', 'what's the architecture?'. One nia_search call "
+                    "replaces ~5 manual file reads."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "repo": {"type": "string", "description": "Repository name"},
-                        "query": {"type": "string", "description": "Natural language search query"},
+                        "repo": {"type": "string", "description": "Repository name (e.g. 'blewIt')"},
+                        "query": {"type": "string", "description": "Natural language question, e.g. 'Is there real authentication with password hashing?'"},
                     },
                     "required": ["repo", "query"],
                 },
@@ -772,12 +779,18 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
         f"GitHub user: {github_username}\n"
         "Available repositories (use the FULL URL when filling receipts.url):\n"
         f"{repo_url_lines}\n\n"
+        "IMPORTANT — investigation strategy:\n"
+        "  1. ALWAYS start by calling `nia_search` with a semantic question about the claim "
+        "(e.g. 'Is there a real distributed system here, or just a single Express server?'). "
+        "Nia indexes the entire codebase and returns a synthesized answer with file citations "
+        "in one call — far more efficient than reading individual files.\n"
+        "  2. Only fall back to `github_tree` / `github_file` / `github_commits` when you need "
+        "to verify a specific detail Nia surfaced.\n\n"
         "When you submit_verdict, every receipt MUST have a fully-qualified GitHub URL "
         f"like https://github.com/{github_username}/<repo>/... — never just /repo or a bare path.\n"
-        "For each receipt where you read a file or fetched commits, include a `snippet` "
-        "field: 1-3 lines of the actual code or commit message text that supports the "
-        "receipt. Quote literally — do not paraphrase. The recruiter will see this snippet "
-        "rendered next to the link.\n"
+        "For each receipt, include a `snippet` field: 1-3 lines of the actual code or commit "
+        "message text that supports the receipt. Quote literally — do not paraphrase. The "
+        "recruiter sees this snippet rendered next to the link.\n"
         f"Investigate each claim, gather evidence, then call submit_verdict. "
         f"Be efficient — cap tool use at {MAX_TOOL_CALLS} calls per claim."
     )
