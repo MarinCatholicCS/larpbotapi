@@ -1,0 +1,77 @@
+{
+  "candidate": "stananan",
+  "githubUrl": "https://github.com/stananan",
+  "analyzedRepos": ["react-dashboard", "ml-pipeline", "hackathon-app"],
+  "overallLarpScore": 72,
+  "overallVerdict": "Heavy on ambition, light on receipts — the code tells a humbler story than the resume.",
+  "subscores": {
+    "skillInflation": 80,
+    "projectSubstance": 65,
+    "roleAuthenticity": 70,
+    "codeDepth": 55
+  },
+  "claims": [
+    {
+      "claim": "3 years of React experience",
+      "verdict": "PARTIAL",
+      "confidence": 0.6,
+      "summary": "React usage is real but activity spans ~14 months, not 3 years. Component patterns are functional but lack advanced hooks.",
+      "evidence": "Oldest React commit found: 14 months ago in react-dashboard. No use of useCallback, useMemo, or custom hooks beyond a single useLocalStorage.",
+      "receipts": [
+        {
+          "type": "commit",
+          "label": "First React commit",
+          "detail": "init: add react scaffold — 14 months ago",
+          "url": "https://github.com/stananan/react-dashboard/commit/a1b2c3d"
+        },
+        {
+          "type": "file",
+          "label": "components/Dashboard.tsx",
+          "detail": "useState only. No memoization, no context, no advanced patterns.",
+          "url": "https://github.com/stananan/react-dashboard/blob/main/components/Dashboard.tsx"
+        }
+      ],
+      "whatToAskNext": "Walk me through the most complex React pattern you've built and why you chose it."
+    },
+    {
+      "claim": "Built a production ML pipeline",
+      "verdict": "CONTRADICTED",
+      "confidence": 0.85,
+      "summary": "The ml-pipeline repo is a Jupyter notebook tutorial clone with no deployment infrastructure, no data pipeline, and one dataset: iris.csv.",
+      "evidence": "ml-pipeline/notebook.ipynb: sklearn LinearRegression on iris.csv with accuracy printout. No CI/CD, no serving layer, no real data ingestion.",
+      "receipts": [
+        {
+          "type": "file",
+          "label": "ml-pipeline/notebook.ipynb",
+          "detail": "from sklearn.datasets import load_iris — tutorial-grade code",
+          "url": "https://github.com/stananan/ml-pipeline/blob/main/notebook.ipynb"
+        },
+        {
+          "type": "pattern",
+          "label": "No deployment config found",
+          "detail": "Zero Dockerfile, requirements.txt only lists sklearn+pandas, no serving layer",
+          "url": "https://github.com/stananan/ml-pipeline"
+        }
+      ],
+      "whatToAskNext": "How did you handle model versioning and rollback in production? What monitoring did you set up?"
+    },
+    {
+      "claim": "Led backend architecture for a real-time system",
+      "verdict": "UNVERIFIED",
+      "confidence": 0.2,
+      "summary": "No evidence of real-time systems, websockets, or backend architecture in any indexed repository.",
+      "evidence": "Searched all repos for websocket, socket.io, SSE, event-driven, pubsub, kafka, redis — zero matches. No backend repos beyond a small Express hello-world.",
+      "receipts": [
+        {
+          "type": "repo",
+          "label": "hackathon-app",
+          "detail": "Only backend code: 40-line Express server with 2 GET routes",
+          "url": "https://github.com/stananan/hackathon-app"
+        }
+      ],
+      "whatToAskNext": "Which repo has the real-time system? Can you share the architecture diagram or ADR you wrote for it?"
+    }
+  ],
+  "redemption": "The hackathon projects are genuinely shipped and functional — this is someone who executes under pressure, which counts for a lot.",
+  "analyzedAt": "2026-05-09T14:32:00Z"
+}
