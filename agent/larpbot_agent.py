@@ -9,7 +9,7 @@ Cron schedule (*/5 * * * *) is registered by setup_cron.py after deploy.
 
 Deploy:
   tl secrets set GITHUB_PAT ...
-  tl secrets set ANTHROPIC_API_KEY ...
+  tl secrets set OPENAI_API_KEY ...
   tl secrets set NIA_API_KEY ...
   tl secrets set GMAIL_CLIENT_ID ...
   tl secrets set GMAIL_CLIENT_SECRET ...
@@ -22,14 +22,190 @@ import base64
 import json
 import os
 import re
+import sqlite3
 import time
+from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from typing import Optional
 
-from openai import OpenAI
 import requests
-from pydantic import BaseModel
 from tensorlake.applications import Image, application, function
-from tensorlake.documentai import ChunkingStrategy, DocumentAI, ParsingOptions
+
+
+def _strip_json(text: str) -> str:
+    """Strip markdown code fences that GPT often wraps around JSON."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Gmail helpers (inlined from gmail_client.py)
+# ---------------------------------------------------------------------------
+
+_GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+
+
+def _gmail_service():
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    creds = Credentials(
+        token=None,
+        refresh_token=os.environ["GMAIL_REFRESH_TOKEN"],
+        client_id=os.environ["GMAIL_CLIENT_ID"],
+        client_secret=os.environ["GMAIL_CLIENT_SECRET"],
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=_GMAIL_SCOPES,
+    )
+    creds.refresh(Request())
+    return build("gmail", "v1", credentials=creds)
+
+
+def _gmail_extract_body(payload: dict) -> str:
+    if payload.get("body", {}).get("data"):
+        return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
+    for part in payload.get("parts", []):
+        if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
+            return base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
+    for part in payload.get("parts", []):
+        if part.get("mimeType") == "text/html" and part.get("body", {}).get("data"):
+            raw = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
+            return re.sub(r"<[^>]+>", " ", raw)
+    return ""
+
+
+def _gmail_extract_attachments(payload: dict) -> list:
+    attachments = []
+    for part in payload.get("parts", []):
+        if part.get("filename") and part.get("body", {}).get("attachmentId"):
+            attachments.append({
+                "filename": part["filename"],
+                "attachment_id": part["body"]["attachmentId"],
+                "mime_type": part.get("mimeType", ""),
+            })
+    return attachments
+
+
+def _gmail_parse_message(msg: dict) -> dict:
+    headers = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
+    return {
+        "message_id": msg["id"],
+        "thread_id": msg["threadId"],
+        "from_email": headers.get("From", ""),
+        "subject": headers.get("Subject", ""),
+        "body_text": _gmail_extract_body(msg["payload"]),
+        "attachments": _gmail_extract_attachments(msg["payload"]),
+    }
+
+
+def get_unread_recruiting_emails() -> list:
+    svc = _gmail_service()
+    resp = svc.users().messages().list(userId="me", q="is:unread category:primary", maxResults=20).execute()
+    messages = resp.get("messages", [])
+    results = []
+    for m in messages:
+        msg = svc.users().messages().get(userId="me", id=m["id"], format="full").execute()
+        results.append(_gmail_parse_message(msg))
+    return results
+
+
+def download_attachment(message_id: str, attachment_id: str) -> bytes:
+    svc = _gmail_service()
+    resp = svc.users().messages().attachments().get(
+        userId="me", messageId=message_id, id=attachment_id
+    ).execute()
+    return base64.urlsafe_b64decode(resp["data"])
+
+
+def mark_as_read(message_id: str) -> None:
+    svc = _gmail_service()
+    svc.users().messages().modify(
+        userId="me", id=message_id, body={"removeLabelIds": ["UNREAD"]}
+    ).execute()
+
+
+def send_gmail(to_email: str, subject: str, html_body: str) -> None:
+    svc = _gmail_service()
+    msg = MIMEMultipart("alternative")
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html"))
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    svc.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+
+def extract_github_username(text: str) -> Optional[str]:
+    match = re.search(r"github\.com/([A-Za-z0-9_-]+)", text)
+    return match.group(1) if match else None
+
+
+# ---------------------------------------------------------------------------
+# Memory helpers (inlined from memory.py)
+# ---------------------------------------------------------------------------
+
+_DB_PATH = "/tmp/larpbot_memory.db"
+
+
+def _db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS candidates (
+            github_username TEXT PRIMARY KEY,
+            verdict_json    TEXT NOT NULL,
+            larp_score      INTEGER,
+            analyzed_at     TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def memory_get_candidate(username: str) -> Optional[dict]:
+    with _db_conn() as conn:
+        row = conn.execute(
+            "SELECT verdict_json FROM candidates WHERE github_username = ?",
+            (username.lower(),),
+        ).fetchone()
+    return json.loads(row["verdict_json"]) if row else None
+
+
+def memory_store_candidate(username: str, verdict: dict) -> None:
+    with _db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO candidates (github_username, verdict_json, larp_score, analyzed_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(github_username) DO UPDATE SET
+                verdict_json = excluded.verdict_json,
+                larp_score   = excluded.larp_score,
+                analyzed_at  = excluded.analyzed_at
+            """,
+            (
+                username.lower(),
+                json.dumps(verdict),
+                verdict.get("overallLarpScore"),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+
+def memory_list_candidates() -> list:
+    with _db_conn() as conn:
+        rows = conn.execute(
+            "SELECT github_username, larp_score, analyzed_at FROM candidates ORDER BY analyzed_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def memory_candidate_count() -> int:
+    with _db_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
 
 # ---------------------------------------------------------------------------
 # Container image shared by all functions
@@ -71,41 +247,11 @@ ALL_SECRETS = [
     timeout=60,
 )
 def fetch_unread_emails() -> list[dict]:
-    from gmail_client import get_unread_recruiting_emails
     return get_unread_recruiting_emails()
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Parse a PDF resume attachment via Tensorlake Document AI
-# ---------------------------------------------------------------------------
-
-@function(
-    description="Parse PDF resume bytes and return extracted text",
-    image=AGENT_IMAGE,
-    secrets=["TENSORLAKE_API_KEY"],
-    timeout=120,
-)
-def parse_resume_pdf(pdf_bytes_b64: str) -> str:
-    """Upload PDF to Tensorlake Document AI and extract text."""
-    import tempfile, os as _os
-    pdf_bytes = base64.b64decode(pdf_bytes_b64)
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-        f.write(pdf_bytes)
-        tmp_path = f.name
-    try:
-        doc_ai = DocumentAI()
-        parse_id = doc_ai.read(
-            file_path=tmp_path,
-            parsing_options=ParsingOptions(chunking_strategy=ChunkingStrategy.PAGE),
-        )
-        result = doc_ai.wait_for_completion(parse_id)
-        return "\n\n".join(c.content for c in result.chunks)
-    finally:
-        _os.unlink(tmp_path)
-
-
-# ---------------------------------------------------------------------------
-# Step 3: Extract GitHub username + structured claims from email + resume text
+# Step 2: Extract GitHub username + structured claims from email
 # ---------------------------------------------------------------------------
 
 @function(
@@ -118,6 +264,7 @@ def extract_claims_from_email(email_body: str, resume_text: str) -> dict:
     """
     Returns {"github_username": str | None, "claims": list[str]}
     """
+    from openai import OpenAI
     client = OpenAI()
     combined = f"EMAIL BODY:\n{email_body}\n\nRESUME TEXT:\n{resume_text}"
     resp = client.chat.completions.create(
@@ -137,7 +284,7 @@ def extract_claims_from_email(email_body: str, resume_text: str) -> dict:
             ),
         }],
     )
-    text = resp.choices[0].message.content.strip()
+    text = _strip_json(resp.choices[0].message.content.strip())
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -182,13 +329,20 @@ def index_github_repos(github_username: str) -> dict[str, str]:
     index_ids: dict[str, str] = {}
     for repo in repos:
         clone_url = repo["clone_url"]
-        r = requests.post(NIA_API + "/indexes", headers=_nia_headers(), json={"url": clone_url})
-        if not r.ok:
+        try:
+            r = requests.post(NIA_API + "/indexes", headers=_nia_headers(), json={"url": clone_url}, timeout=10)
+            if not r.ok:
+                continue
+            index_id = r.json().get("id") or r.json().get("indexId") or r.json().get("index_id")
+            if not index_id:
+                continue
+            index_ids[repo["name"]] = index_id
+        except Exception as e:
+            print(f"Nia index failed for {repo['name']}: {e}")
             continue
-        index_id = r.json().get("id") or r.json().get("indexId") or r.json().get("index_id")
-        if not index_id:
-            continue
-        index_ids[repo["name"]] = index_id
+
+    if not index_ids:
+        return {}
 
     # Poll until all ready (max 90s)
     deadline = time.time() + 90
@@ -197,13 +351,14 @@ def index_github_repos(github_username: str) -> dict[str, str]:
         time.sleep(3)
         done = set()
         for idx_id in list(pending):
-            sr = requests.get(f"{NIA_API}/indexes/{idx_id}", headers=_nia_headers())
-            if not sr.ok:
-                continue
-            status = sr.json().get("status") or sr.json().get("state") or ""
-            if status in ("ready", "complete", "completed"):
-                done.add(idx_id)
-            elif status in ("error", "failed"):
+            try:
+                sr = requests.get(f"{NIA_API}/indexes/{idx_id}", headers=_nia_headers(), timeout=10)
+                if not sr.ok:
+                    continue
+                status = sr.json().get("status") or sr.json().get("state") or ""
+                if status in ("ready", "complete", "completed", "error", "failed"):
+                    done.add(idx_id)
+            except Exception:
                 done.add(idx_id)
         pending -= done
 
@@ -226,11 +381,15 @@ def _gh_headers() -> dict:
 
 
 def _nia_query(index_id: str, query: str, top_k: int = 5) -> list[dict]:
-    r = requests.post(
-        f"{NIA_API}/indexes/{index_id}/query",
-        headers=_nia_headers(),
-        json={"query": query, "top_k": top_k},
-    )
+    try:
+        r = requests.post(
+            f"{NIA_API}/indexes/{index_id}/query",
+            headers=_nia_headers(),
+            json={"query": query, "top_k": top_k},
+            timeout=10,
+        )
+    except Exception:
+        return []
     if not r.ok:
         return []
     data = r.json()
@@ -256,6 +415,7 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
     Runs the full agentic loop for each claim, then synthesizes the overall verdict.
     Returns an AnalysisResult-shaped dict.
     """
+    from openai import OpenAI
     client = OpenAI()
 
     # Fetch repo metadata for context
@@ -439,7 +599,7 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
             ),
         }],
     )
-    overall = json.loads(synth_resp.choices[0].message.content.strip())
+    overall = json.loads(_strip_json(synth_resp.choices[0].message.content.strip()))
 
     return {
         "candidate": github_username,
@@ -530,8 +690,6 @@ def _fallback_claim(claim: str) -> dict:
     timeout=30,
 )
 def send_verdict_email(to_email: str, candidate_username: str, verdict: dict) -> None:
-    from gmail_client import send_verdict_email as _send
-
     top_receipts = []
     for cv in verdict.get("claims", []):
         for r in cv.get("receipts", [])[:1]:
@@ -576,7 +734,7 @@ def send_verdict_email(to_email: str, candidate_username: str, verdict: dict) ->
     </div>
     """
 
-    _send(
+    send_gmail(
         to_email=to_email,
         subject=f"LARPbot: {candidate_username} — LARP Score {score}/100",
         html_body=html,
@@ -594,8 +752,6 @@ def send_verdict_email(to_email: str, candidate_username: str, verdict: dict) ->
     timeout=30,
 )
 def send_error_email(to_email: str, candidate_username: str, reason: str) -> None:
-    from gmail_client import send_verdict_email as _send
-
     html = f"""
     <div style="font-family:monospace;max-width:640px;margin:0 auto;background:#09090b;color:#e4e4e7;padding:32px;border-radius:8px;">
       <h2 style="color:#fff;margin:0 0 4px">LARPbot: Analysis Failed</h2>
@@ -616,7 +772,7 @@ def send_error_email(to_email: str, candidate_username: str, reason: str) -> Non
     </div>
     """
 
-    _send(
+    send_gmail(
         to_email=to_email,
         subject=f"LARPbot: Could not analyze {candidate_username}",
         html_body=html,
@@ -647,9 +803,6 @@ def poll_recruiting_inbox() -> dict:
       6. Store verdict in SQLite memory
       7. Send verdict email to recruiter
     """
-    import memory
-    from gmail_client import download_attachment, extract_github_username, mark_as_read
-
     emails = fetch_unread_emails()
     processed = []
     skipped_cached = []
@@ -664,26 +817,16 @@ def poll_recruiting_inbox() -> dict:
             continue
 
         # Check durable memory — skip if already analyzed
-        cached = memory.get_candidate(username)
+        cached = memory_get_candidate(username)
         if cached:
             skipped_cached.append(username)
             mark_as_read(email["message_id"])
-            # Re-send cached verdict so recruiter still gets a response
             send_verdict_email(from_email, username, cached)
             continue
 
         try:
-            # Parse PDF resume if attached
-            resume_text = ""
-            for attachment in email["attachments"]:
-                if "pdf" in attachment["mime_type"].lower() or attachment["filename"].endswith(".pdf"):
-                    pdf_bytes = download_attachment(email["message_id"], attachment["attachment_id"])
-                    pdf_b64 = base64.b64encode(pdf_bytes).decode()
-                    resume_text = parse_resume_pdf(pdf_b64)
-                    break
-
-            # Extract structured claims
-            extraction = extract_claims_from_email(body, resume_text)
+            # Extract structured claims from email body
+            extraction = extract_claims_from_email(body, "")
             github_username = extraction.get("github_username") or username
             claims = extraction.get("claims") or []
 
@@ -696,7 +839,7 @@ def poll_recruiting_inbox() -> dict:
             verdict = verify_claims(github_username, claims, index_ids)
 
             # Store in durable memory
-            memory.store_candidate(github_username, verdict)
+            memory_store_candidate(github_username, verdict)
 
             # Send verdict to recruiter
             send_verdict_email(from_email, github_username, verdict)
@@ -716,7 +859,7 @@ def poll_recruiting_inbox() -> dict:
         "emails_checked": len(emails),
         "candidates_analyzed": processed,
         "candidates_from_cache": skipped_cached,
-        "total_in_memory": memory.candidate_count(),
+        "total_in_memory": memory_candidate_count(),
     }
 
 
@@ -731,8 +874,7 @@ def poll_recruiting_inbox() -> dict:
     timeout=30,
 )
 def query_candidates() -> list[dict]:
-    import memory
-    return memory.list_candidates()
+    return memory_list_candidates()
 
 
 @application(tags={"project": "larpbot"})
@@ -742,5 +884,4 @@ def query_candidates() -> list[dict]:
     timeout=30,
 )
 def get_candidate(github_username: str) -> Optional[dict]:
-    import memory
-    return memory.get_candidate(github_username)
+    return memory_get_candidate(github_username)

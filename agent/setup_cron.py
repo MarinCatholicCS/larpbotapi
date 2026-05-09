@@ -33,37 +33,35 @@ def create_schedule():
     resp = requests.post(
         f"{BASE}/applications/{APP}/cron-schedules",
         headers=headers(),
-        json={"cron_expression": "*/5 * * * *"},
+        json={"cron_expression": "* * * * *"},
     )
     if resp.ok:
         data = resp.json()
         print(f"Schedule created: {data.get('schedule_id')}")
-        print("Expression: */5 * * * * (every 5 minutes)")
+        print("Expression: * * * * * (every 1 minute)")
     else:
         print(f"Failed: {resp.status_code} {resp.text}")
+
+
+def _get_schedules():
+    resp = requests.get(f"{BASE}/applications/{APP}/cron-schedules", headers=headers())
+    if not resp.ok:
+        print(f"Failed to list: {resp.status_code} {resp.text}")
+        return []
+    data = resp.json()
+    return data.get("schedules", data) if isinstance(data, dict) else data
 
 
 def list_schedules():
-    resp = requests.get(
-        f"{BASE}/applications/{APP}/cron-schedules",
-        headers=headers(),
-    )
-    if resp.ok:
-        schedules = resp.json()
-        if not schedules:
-            print("No schedules found.")
-        for s in schedules:
-            print(json.dumps(s, indent=2))
-    else:
-        print(f"Failed: {resp.status_code} {resp.text}")
+    schedules = _get_schedules()
+    if not schedules:
+        print("No schedules found.")
+    for s in schedules:
+        print(json.dumps(s, indent=2))
 
 
 def delete_all():
-    resp = requests.get(f"{BASE}/applications/{APP}/cron-schedules", headers=headers())
-    if not resp.ok:
-        print(f"Failed to list: {resp.status_code}")
-        return
-    for s in resp.json():
+    for s in _get_schedules():
         sid = s.get("id") or s.get("schedule_id")
         dr = requests.delete(f"{BASE}/applications/{APP}/cron-schedules/{sid}", headers=headers())
         print(f"Deleted {sid}: {dr.status_code}")

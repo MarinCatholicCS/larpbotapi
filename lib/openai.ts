@@ -3,6 +3,14 @@ import { getCommitSample, getFileContent, getFileTree } from "./github";
 import { queryNia, NiaSnippet } from "./nia";
 import { ClaimVerification, Receipt } from "./types";
 
+function stripJson(text: string): string {
+  text = text.trim();
+  if (text.startsWith("```")) {
+    text = text.replace(/^```[a-zA-Z]*\n?/, "").replace(/\n?```$/, "");
+  }
+  return text.trim();
+}
+
 const client = new OpenAI();
 
 export async function parseClaims(claimsText: string): Promise<string[]> {
@@ -16,7 +24,7 @@ export async function parseClaims(claimsText: string): Promise<string[]> {
       },
     ],
   });
-  const text = resp.choices[0].message.content?.trim() ?? "";
+  const text = stripJson(resp.choices[0].message.content?.trim() ?? "");
   try {
     return JSON.parse(text);
   } catch {
@@ -315,6 +323,6 @@ Return ONLY valid JSON (no markdown) with this exact shape:
     ],
   });
 
-  const text = resp.choices[0].message.content?.trim() ?? "{}";
+  const text = stripJson(resp.choices[0].message.content?.trim() ?? "{}");
   return JSON.parse(text);
 }
