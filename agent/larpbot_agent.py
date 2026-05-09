@@ -1183,8 +1183,14 @@ def poll_recruiting_inbox() -> dict:
             github_username = extraction.get("github_username") or username
             claims = extraction.get("claims") or []
 
+            # If the email has no specific technical claims (e.g. a brief intro
+            # email that just shares a GitHub URL), still produce a LARP Report
+            # by evaluating the developer's overall GitHub credibility.
             if not claims:
-                continue
+                claims = [
+                    f"github.com/{github_username} demonstrates meaningful software "
+                    f"engineering experience and code substance"
+                ]
 
             index_ids = index_github_repos(github_username)
             verdict = verify_claims(github_username, claims, index_ids)
