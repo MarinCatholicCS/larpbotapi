@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "crypto";
 import { getTopRepos } from "@/lib/github";
-import { indexRepo, pollIndexStatus } from "@/lib/nia";
+import { indexRepo, pollIndexStatus, queryNia } from "@/lib/nia";
 import { parseClaims, verifyClaim, synthesizeOverall } from "@/lib/openai";
 import { createJob, updateJob } from "@/lib/jobStore";
 import { AnalysisResult } from "@/lib/types";
@@ -74,8 +74,27 @@ async function runAnalysis(jobId: string, username: string, claimsText: string):
     language: r.language,
   }));
 
-  const verifiedClaims = [];
+  // Pre-pass: query Nia for every indexed repo so all show ✓ and the
+  // agent has Nia's view of every repo before it starts reasoning.
   const niaUsed = { queried: new Set<string>() };
+  if (Object.keys(indexIds).length > 0) {
+    updateJob(jobId, { progress: 50, message: "Briefing Nia on every repo..." });
+    const briefingQuery =
+      `Considering these claims about the developer: ${parsedClaims.map((c) => `"${c}"`).join("; ")}. ` +
+      `What evidence supports or contradicts each? What is the actual implementation depth?`;
+    await Promise.all(
+      Object.values(indexIds).map(async (slug) => {
+        try {
+          const snippets = await queryNia(slug, briefingQuery);
+          if (snippets.length > 0) niaUsed.queried.add(slug);
+        } catch (err) {
+          console.error(`Nia briefing failed for ${slug}:`, err);
+        }
+      })
+    );
+  }
+
+  const verifiedClaims = [];
   for (let i = 0; i < parsedClaims.length; i++) {
     const claim = parsedClaims[i];
     updateJob(jobId, {

@@ -660,16 +660,19 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
     # Cap claim count to control token spend.
     claims = claims[:MAX_CLAIMS]
 
-    # Fetch repo metadata for context
+    # Fetch repo metadata for context — full list, then narrow to what Nia indexed.
     gh_resp = requests.get(
         f"{GITHUB_API}/users/{github_username}/repos",
         headers=_gh_headers(),
-        params={"type": "owner", "sort": "pushed", "per_page": 10},
+        params={"type": "owner", "sort": "pushed", "per_page": 30},
     )
-    all_repos = [r for r in (gh_resp.json() if gh_resp.ok else []) if not r.get("fork")]
-    top_repos = all_repos[:3]
-    repo_names = [r["name"] for r in top_repos]
-    repo_full_names = {r["name"]: r["full_name"] for r in top_repos}
+    full_metadata = {r["name"]: r for r in (gh_resp.json() if gh_resp.ok else []) if not r.get("fork")}
+
+    # Source of truth for which repos to investigate = whatever Nia indexed.
+    # That's the GPT-curated subset selected for relevance to the claims.
+    repo_names = list(index_ids.keys())
+    repo_full_names = dict(index_ids)  # name -> "owner/repo" slug
+    all_repos = [full_metadata[n] for n in repo_names if n in full_metadata]
 
     tools = [
         {
@@ -774,33 +777,73 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
         f"  - {name}  →  https://github.com/{full}"
         for name, full in repo_full_names.items()
     )
+
+    # Build a "Nia briefing" block — already has Nia's per-repo answer to the claims.
+    if nia_briefings:
+        briefing_lines = []
+        for slug, r in nia_briefings.items():
+            ans = (r.get("answer") or "").strip()
+            cites = r.get("citations") or []
+            briefing_lines.append(
+                f"  ▸ {slug}\n"
+                f"    {ans[:600]}"
+                + (f"\n    Citations: {', '.join(cites[:4])}" if cites else "")
+            )
+        briefing_block = (
+            "\nNia has already analyzed every repo for relevance to the claims. "
+            "Use this as your foundation — only call additional tools to verify specific details:\n\n"
+            + "\n\n".join(briefing_lines)
+            + "\n"
+        )
+    else:
+        briefing_block = ""
+
     system = (
         "You are LARPbot, an AI investigator that verifies developer claims against their actual GitHub code.\n"
         f"GitHub user: {github_username}\n"
         "Available repositories (use the FULL URL when filling receipts.url):\n"
-        f"{repo_url_lines}\n\n"
-        "IMPORTANT — investigation strategy:\n"
-        "  1. ALWAYS start by calling `nia_search` with a semantic question about the claim "
-        "(e.g. 'Is there a real distributed system here, or just a single Express server?'). "
-        "Nia indexes the entire codebase and returns a synthesized answer with file citations "
-        "in one call — far more efficient than reading individual files.\n"
-        "  2. Only fall back to `github_tree` / `github_file` / `github_commits` when you need "
-        "to verify a specific detail Nia surfaced.\n\n"
+        f"{repo_url_lines}\n"
+        f"{briefing_block}\n"
+        "Investigation strategy:\n"
+        "  1. The Nia briefings above already cover every repo. Read them carefully.\n"
+        "  2. For follow-up questions, use `nia_search` first — semantic, cross-file.\n"
+        "  3. Use `github_file` / `github_tree` / `github_commits` only to confirm specific details.\n\n"
         "When you submit_verdict, every receipt MUST have a fully-qualified GitHub URL "
         f"like https://github.com/{github_username}/<repo>/... — never just /repo or a bare path.\n"
         "For each receipt, include a `snippet` field: 1-3 lines of the actual code or commit "
-        "message text that supports the receipt. Quote literally — do not paraphrase. The "
-        "recruiter sees this snippet rendered next to the link.\n"
+        "message text that supports the receipt. Quote literally — do not paraphrase.\n"
         f"Investigate each claim, gather evidence, then call submit_verdict. "
         f"Be efficient — cap tool use at {MAX_TOOL_CALLS} calls per claim."
     )
 
-    verified_claims = []
     # Tracks per-repo Nia query success. A repo is added to `queried` when
     # nia_search returns a substantive answer for it. Surfaced as
-    # `niaVerified` (boolean) and `niaQueriedRepos` (slug list) on the verdict
-    # so the email/UI can show which repos Nia actually contributed evidence for.
+    # `niaVerified` (boolean) and `niaQueriedRepos` (slug list) on the verdict.
     nia_used: dict = {"queried": set()}
+
+    # Pre-pass: query Nia for every indexed repo with a single comprehensive
+    # claim-aware question. Results are injected into the system prompt so the
+    # agent has Nia's view of every repo from the start, and every indexed
+    # repo gets at least one query (✓ in the Nia coverage block).
+    nia_briefings: dict[str, dict] = {}
+    if claims and repo_full_names:
+        briefing_query = (
+            f"Considering these claims about the developer: "
+            + "; ".join(f'"{c}"' for c in claims)
+            + ". What evidence in this codebase supports or contradicts each? "
+            "What is the actual implementation depth (real code vs scaffolding)?"
+        )
+        for slug in repo_full_names.values():
+            try:
+                r = _nia_query(slug, briefing_query)
+                ans = (r.get("answer") or "").strip()
+                if ans and not ans.startswith("(Nia "):
+                    nia_briefings[slug] = r
+                    nia_used["queried"].add(slug)
+            except Exception as e:
+                print(f"Nia briefing failed for {slug}: {e}")
+
+    verified_claims = []
 
     for claim in claims:
         messages = [
