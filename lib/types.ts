@@ -30,6 +30,8 @@ export interface AnalysisResult {
   claims: ClaimVerification[];
   redemption: string;
   analyzedAt: string;
+  /** True if Nia returned at least one substantive search result during verification. */
+  niaVerified?: boolean;
 }
 
 export interface StatusResponse {

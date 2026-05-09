@@ -114,14 +114,24 @@ export default function ResultsPanel({
       {/* Header */}
       <div className="flex items-start justify-between">
         <div>
-          <a
-            href={result.githubUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-lg font-semibold text-white hover:text-zinc-300 transition-colors"
-          >
-            {result.candidate}
-          </a>
+          <div className="flex items-center gap-2">
+            <a
+              href={result.githubUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-lg font-semibold text-white hover:text-zinc-300 transition-colors"
+            >
+              {result.candidate}
+            </a>
+            {result.niaVerified && (
+              <span
+                className="inline-block bg-indigo-950 border border-indigo-500 text-indigo-300 text-[10px] uppercase tracking-widest px-2 py-0.5 rounded"
+                title="Cross-file evidence verified by Nia semantic search"
+              >
+                ✓ Verified by Nia
+              </span>
+            )}
+          </div>
           <p className="text-xs text-zinc-500 mt-0.5">
             Analyzed {result.analyzedRepos.join(", ")} &middot;{" "}
             {new Date(result.analyzedAt).toLocaleTimeString()}

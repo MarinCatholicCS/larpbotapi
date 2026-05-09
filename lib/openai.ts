@@ -37,6 +37,12 @@ interface AgentContext {
   indexIds: Record<string, string>; // repoName → indexId
   repoMetas: Array<{ name: string; fullName: string; htmlUrl: string; language: string | null }>;
   owner: string;
+  /**
+   * Mutable flag set to true when nia_search returns a substantive answer.
+   * Threaded through so the orchestrator can mark the AnalysisResult as
+   * niaVerified for the UI badge.
+   */
+  niaUsed?: { flag: boolean };
 }
 
 const MAX_TOOL_CALLS = 8;
@@ -206,22 +212,25 @@ Don't be mean for its own sake — just honest. Cap tool use to ${MAX_TOOL_CALLS
       } else {
         try {
           if (name === "nia_search") {
-            const indexId = ctx.indexIds[input.repo];
-            if (!indexId) {
+            const slug = ctx.indexIds[input.repo];
+            if (!slug) {
               result = `No index found for repo: ${input.repo}`;
             } else {
-              const snippets: NiaSnippet[] = await queryNia(indexId, input.query);
+              const snippets: NiaSnippet[] = await queryNia(slug, input.query);
+              if (snippets.length > 0 && ctx.niaUsed) {
+                ctx.niaUsed.flag = true;
+              }
               result = snippets
                 .map((s, i) => `[${i + 1}] ${s.filePath}\n${s.content}`)
                 .join("\n\n---\n\n");
               for (const s of snippets.slice(0, 2)) {
                 const repo = ctx.repoMetas.find((r) => r.name === input.repo);
-                if (repo) {
+                if (repo && !s.filePath.includes("(Nia synthesis)")) {
                   collectedReceipts.push({
                     type: "file",
                     label: s.filePath,
                     detail: s.content.slice(0, 150),
-                    url: `${repo.htmlUrl}/blob/HEAD/${s.filePath}`,
+                    url: `https://github.com/${s.filePath}`,
                   });
                 }
               }

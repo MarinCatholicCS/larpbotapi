@@ -708,6 +708,10 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
     )
 
     verified_claims = []
+    # Tracks whether at least one nia_search call returned a substantive
+    # answer during this verification run. Surfaced as `niaVerified` on the
+    # final verdict so the email can show a "Verified by Nia" badge.
+    nia_used = {"flag": False}
 
     for claim in claims:
         messages = [
@@ -752,7 +756,7 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
                 if tool_calls_used > MAX_TOOL_CALLS:
                     result_text = "Tool limit reached. Submit verdict now."
                 else:
-                    result_text = _run_tool(name, inp, index_ids, github_username, all_repos)
+                    result_text = _run_tool(name, inp, index_ids, github_username, all_repos, nia_used)
 
                 messages.append({
                     "role": "tool",
@@ -801,6 +805,7 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
         "claims": verified_claims,
         "redemption": overall["redemption"],
         "recentActivity": recent_activity,
+        "niaVerified": nia_used["flag"],
         "analyzedAt": __import__("datetime").datetime.utcnow().isoformat() + "Z",
     }
 
@@ -847,7 +852,7 @@ def _fetch_recent_activity(repos: list[dict], limit_per_repo: int = 5) -> list[d
     return out
 
 
-def _run_tool(name: str, inp: dict, index_ids: dict, username: str, repos: list) -> str:
+def _run_tool(name: str, inp: dict, index_ids: dict, username: str, repos: list, nia_used: Optional[dict] = None) -> str:
     try:
         repo_name = inp.get("repo", "")
         full_name = next((r["full_name"] for r in repos if r["name"] == repo_name), f"{username}/{repo_name}")
@@ -858,9 +863,13 @@ def _run_tool(name: str, inp: dict, index_ids: dict, username: str, repos: list)
             if not slug:
                 return f"No Nia index for {repo_name}"
             result = _nia_query(slug, inp.get("query", ""))
-            answer = result["answer"] or "(no answer)"
-            cites = "\n".join(f"  - https://github.com/{c}" for c in result["citations"][:6])
-            return f"{answer}\n\nCitations:\n{cites}" if cites else answer
+            answer = result["answer"] or ""
+            citations = result["citations"]
+            # Flag Nia as actually used iff we got a real answer (not a 404/error stub).
+            if nia_used is not None and answer and not answer.startswith("(Nia "):
+                nia_used["flag"] = True
+            cites = "\n".join(f"  - https://github.com/{c}" for c in citations[:6])
+            return f"{answer}\n\nCitations:\n{cites}" if cites else (answer or "(no answer)")
 
         elif name == "github_commits":
             r = requests.get(
@@ -966,10 +975,16 @@ def send_verdict_email(
     score = verdict.get("overallLarpScore", "?")
     verdict_text = verdict.get("overallVerdict", "")
     score_color = "#22c55e" if score < 30 else "#eab308" if score < 60 else "#ef4444"
+    nia_badge = (
+        '<span style="display:inline-block;background:#1e1b4b;border:1px solid #6366f1;'
+        'color:#a5b4fc;font-size:10px;text-transform:uppercase;letter-spacing:.1em;'
+        'padding:3px 8px;border-radius:4px;margin-left:8px;vertical-align:middle">'
+        '✓ Verified by Nia</span>'
+    ) if verdict.get("niaVerified") else ""
 
     html = f"""
     <div style="font-family:monospace;max-width:640px;margin:0 auto;background:#09090b;color:#e4e4e7;padding:32px;border-radius:8px;">
-      <h2 style="color:#fff;margin:0 0 4px">LARP Report: <a href="https://github.com/{candidate_username}" style="color:#a1a1aa">{candidate_username}</a></h2>
+      <h2 style="color:#fff;margin:0 0 4px">LARP Report: <a href="https://github.com/{candidate_username}" style="color:#a1a1aa">{candidate_username}</a>{nia_badge}</h2>
       <p style="color:#71717a;margin:0 0 24px">Automated candidate verification</p>
 
       <div style="background:#18181b;border:1px solid #27272a;border-radius:6px;padding:20px;margin-bottom:24px">

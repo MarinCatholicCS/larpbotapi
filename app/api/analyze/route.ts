@@ -75,6 +75,7 @@ async function runAnalysis(jobId: string, username: string, claimsText: string):
   }));
 
   const verifiedClaims = [];
+  const niaUsed = { flag: false };
   for (let i = 0; i < parsedClaims.length; i++) {
     const claim = parsedClaims[i];
     updateJob(jobId, {
@@ -86,6 +87,7 @@ async function runAnalysis(jobId: string, username: string, claimsText: string):
       indexIds,
       repoMetas,
       owner: username,
+      niaUsed,
     });
     verifiedClaims.push(result);
   }
@@ -103,6 +105,7 @@ async function runAnalysis(jobId: string, username: string, claimsText: string):
     subscores: overall.subscores,
     claims: verifiedClaims,
     redemption: overall.redemption,
+    niaVerified: niaUsed.flag,
     analyzedAt: new Date().toISOString(),
   };
 
