@@ -155,8 +155,33 @@ def github_user_exists(username: str) -> bool:
     return True
 
 
-def thread_has_my_reply(thread_id: str, my_email: str) -> bool:
-    """True if any message in this Gmail thread was sent by us. Used as dedup lock."""
+def thread_has_my_larp_report(thread_id: str, my_email: str) -> bool:
+    """True if we've already sent a final LARP Report in this thread. Help-request
+    replies don't count — those are intermediate prompts, not the final analysis."""
+    if not thread_id:
+        return False
+    svc = _gmail_service()
+    try:
+        thread = svc.users().threads().get(
+            userId="me", id=thread_id, format="metadata",
+            metadataHeaders=["From", "Subject"],
+        ).execute()
+    except Exception:
+        return False
+    me = my_email.lower()
+    for msg in thread.get("messages", []):
+        headers = msg.get("payload", {}).get("headers", [])
+        from_h = next((h["value"] for h in headers if h["name"].lower() == "from"), "")
+        subj_h = next((h["value"] for h in headers if h["name"].lower() == "subject"), "")
+        if me in from_h.lower() and subj_h.lower().startswith("larp report:"):
+            return True
+    return False
+
+
+def last_thread_message_is_from_me(thread_id: str, my_email: str) -> bool:
+    """True if WE sent the latest message in the thread (i.e. applicant has not
+    replied since our last reply). Used to avoid double-replying to the same
+    state (e.g. spamming help requests on Pub/Sub retries)."""
     if not thread_id:
         return False
     svc = _gmail_service()
@@ -167,13 +192,36 @@ def thread_has_my_reply(thread_id: str, my_email: str) -> bool:
         ).execute()
     except Exception:
         return False
+    messages = thread.get("messages", [])
+    if not messages:
+        return False
+    headers = messages[-1].get("payload", {}).get("headers", [])
+    from_h = next((h["value"] for h in headers if h["name"].lower() == "from"), "")
+    return my_email.lower() in from_h.lower()
+
+
+def fetch_thread_context(thread_id: str, my_email: str) -> str:
+    """Concatenate the bodies of all messages in the thread NOT sent by us.
+    Lets us recover earlier claims (e.g. from the applicant's first email)
+    when they reply later with just a GitHub URL."""
+    if not thread_id:
+        return ""
+    svc = _gmail_service()
+    try:
+        thread = svc.users().threads().get(userId="me", id=thread_id, format="full").execute()
+    except Exception:
+        return ""
     me = my_email.lower()
+    parts = []
     for msg in thread.get("messages", []):
         headers = msg.get("payload", {}).get("headers", [])
         from_h = next((h["value"] for h in headers if h["name"].lower() == "from"), "")
         if me in from_h.lower():
-            return True
-    return False
+            continue
+        b = _gmail_extract_body(msg.get("payload", {}))
+        if b:
+            parts.append(b)
+    return "\n\n---\n\n".join(parts)
 
 
 def send_gmail(
@@ -1067,24 +1115,33 @@ def poll_recruiting_inbox() -> dict:
     recruiter_email = get_my_email()
 
     for email in emails:
-        body = email["body_text"]
         from_email = email.get("from_email") or ""
         thread_id = email.get("thread_id")
         rfc_id = email.get("rfc_message_id") or None
         refs = email.get("references") or None
         orig_subject = email.get("subject") or None
 
-        username = extract_github_username(body)
-
-        # Dedup gate #1: if the Gmail thread already contains a message from us,
-        # we've already replied. Skip. This protects against Pub/Sub at-least-once
-        # delivery causing concurrent invocations.
-        if thread_has_my_reply(thread_id, recruiter_email):
-            skipped_cached.append(f"{username or '(no url)'} (already replied)")
+        # Dedup gate #1 (final): if we've already sent a LARP Report in this
+        # thread, the analysis is done. Skip forever.
+        if thread_has_my_larp_report(thread_id, recruiter_email):
+            skipped_cached.append("(report already sent)")
             continue
 
-        # No GitHub URL — REPLY directly to the sender (not the recruiter inbox)
-        # with a plain-text request asking for a valid GitHub profile.
+        # Dedup gate #2 (transient): if our last reply in the thread is the most
+        # recent message, the applicant hasn't responded yet — don't re-reply.
+        # This blocks Pub/Sub at-least-once duplicates from spamming.
+        if last_thread_message_is_from_me(thread_id, recruiter_email):
+            skipped_cached.append("(awaiting applicant)")
+            continue
+
+        # Pull ALL applicant messages from the thread so a follow-up reply
+        # ("here's my github") doesn't lose the claims from the first email.
+        thread_body = fetch_thread_context(thread_id, recruiter_email) or email["body_text"]
+        body = thread_body
+
+        username = extract_github_username(body)
+
+        # No GitHub URL across the entire thread — REPLY to the sender asking for one.
         if not username:
             if from_email:
                 send_request_github_email(
@@ -1112,7 +1169,7 @@ def poll_recruiting_inbox() -> dict:
         if cached:
             skipped_cached.append(username)
             # Re-check right before send in case a parallel invocation just replied
-            if thread_has_my_reply(thread_id, recruiter_email):
+            if thread_has_my_larp_report(thread_id, recruiter_email):
                 continue
             send_verdict_email(
                 recruiter_email, username, cached,
@@ -1136,7 +1193,7 @@ def poll_recruiting_inbox() -> dict:
 
             # Dedup gate #2: another invocation may have finished and sent during
             # our 50s of processing. Re-check the thread immediately before send.
-            if thread_has_my_reply(thread_id, recruiter_email):
+            if thread_has_my_larp_report(thread_id, recruiter_email):
                 skipped_cached.append(f"{github_username} (raced)")
                 continue
 
@@ -1148,7 +1205,7 @@ def poll_recruiting_inbox() -> dict:
             processed.append(github_username)
 
         except Exception as e:
-            if thread_has_my_reply(thread_id, recruiter_email):
+            if thread_has_my_larp_report(thread_id, recruiter_email):
                 continue
             send_error_email(
                 recruiter_email, username,
