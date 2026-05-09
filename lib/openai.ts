@@ -38,11 +38,10 @@ interface AgentContext {
   repoMetas: Array<{ name: string; fullName: string; htmlUrl: string; language: string | null }>;
   owner: string;
   /**
-   * Mutable flag set to true when nia_search returns a substantive answer.
-   * Threaded through so the orchestrator can mark the AnalysisResult as
-   * niaVerified for the UI badge.
+   * Tracks per-repo Nia query success. The orchestrator uses this to set
+   * niaVerified + niaQueriedRepos on the final AnalysisResult.
    */
-  niaUsed?: { flag: boolean };
+  niaUsed?: { queried: Set<string> };
 }
 
 const MAX_TOOL_CALLS = 8;
@@ -218,7 +217,7 @@ Don't be mean for its own sake — just honest. Cap tool use to ${MAX_TOOL_CALLS
             } else {
               const snippets: NiaSnippet[] = await queryNia(slug, input.query);
               if (snippets.length > 0 && ctx.niaUsed) {
-                ctx.niaUsed.flag = true;
+                ctx.niaUsed.queried.add(slug);
               }
               result = snippets
                 .map((s, i) => `[${i + 1}] ${s.filePath}\n${s.content}`)

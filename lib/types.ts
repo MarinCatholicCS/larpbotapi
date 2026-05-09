@@ -34,6 +34,10 @@ export interface AnalysisResult {
   analyzedAt: string;
   /** True if Nia returned at least one substantive search result during verification. */
   niaVerified?: boolean;
+  /** owner/repo slugs that Nia actually answered for (a subset of niaIndexedRepos). */
+  niaQueriedRepos?: string[];
+  /** owner/repo slugs that were indexed by Nia (whether queried or not). */
+  niaIndexedRepos?: string[];
 }
 
 export interface StatusResponse {

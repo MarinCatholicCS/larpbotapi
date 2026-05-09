@@ -796,10 +796,11 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
     )
 
     verified_claims = []
-    # Tracks whether at least one nia_search call returned a substantive
-    # answer during this verification run. Surfaced as `niaVerified` on the
-    # final verdict so the email can show a "Verified by Nia" badge.
-    nia_used = {"flag": False}
+    # Tracks per-repo Nia query success. A repo is added to `queried` when
+    # nia_search returns a substantive answer for it. Surfaced as
+    # `niaVerified` (boolean) and `niaQueriedRepos` (slug list) on the verdict
+    # so the email/UI can show which repos Nia actually contributed evidence for.
+    nia_used: dict = {"queried": set()}
 
     for claim in claims:
         messages = [
@@ -883,6 +884,8 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
     # Collect recent activity (commits) across the analyzed repos for the report.
     recent_activity = _fetch_recent_activity(top_repos[:3], limit_per_repo=5)
 
+    nia_queried_repos = sorted(nia_used["queried"])
+
     return {
         "candidate": github_username,
         "githubUrl": f"https://github.com/{github_username}",
@@ -893,7 +896,9 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
         "claims": verified_claims,
         "redemption": overall["redemption"],
         "recentActivity": recent_activity,
-        "niaVerified": nia_used["flag"],
+        "niaVerified": bool(nia_queried_repos),
+        "niaQueriedRepos": nia_queried_repos,
+        "niaIndexedRepos": list(index_ids.values()),
         "analyzedAt": __import__("datetime").datetime.utcnow().isoformat() + "Z",
     }
 
@@ -953,9 +958,9 @@ def _run_tool(name: str, inp: dict, index_ids: dict, username: str, repos: list,
             result = _nia_query(slug, inp.get("query", ""))
             answer = result["answer"] or ""
             citations = result["citations"]
-            # Flag Nia as actually used iff we got a real answer (not a 404/error stub).
+            # Track which repos Nia actually answered for (vs error stubs).
             if nia_used is not None and answer and not answer.startswith("(Nia "):
-                nia_used["flag"] = True
+                nia_used["queried"].add(slug)
             cites = "\n".join(f"  - https://github.com/{c}" for c in citations[:6])
             return f"{answer}\n\nCitations:\n{cites}" if cites else (answer or "(no answer)")
 
@@ -1077,12 +1082,37 @@ def send_verdict_email(
     score = verdict.get("overallLarpScore", "?")
     verdict_text = verdict.get("overallVerdict", "")
     score_color = "#22c55e" if score < 30 else "#eab308" if score < 60 else "#ef4444"
+    nia_queried = verdict.get("niaQueriedRepos") or []
+    nia_indexed = verdict.get("niaIndexedRepos") or []
     nia_badge = (
         '<span style="display:inline-block;background:#1e1b4b;border:1px solid #6366f1;'
         'color:#a5b4fc;font-size:10px;text-transform:uppercase;letter-spacing:.1em;'
         'padding:3px 8px;border-radius:4px;margin-left:8px;vertical-align:middle">'
         '✓ Verified by Nia</span>'
     ) if verdict.get("niaVerified") else ""
+
+    # Nia coverage block — list every repo Nia indexed + queried for this candidate.
+    if nia_indexed:
+        rows = []
+        for slug in nia_indexed:
+            checked = "✓" if slug in nia_queried else "·"
+            color = "#a5b4fc" if slug in nia_queried else "#52525b"
+            rows.append(
+                f'<li style="color:{color};margin-bottom:2px">'
+                f'<span style="display:inline-block;width:14px">{checked}</span>'
+                f'<a href="https://github.com/{slug}" style="color:{color};text-decoration:none">{slug}</a>'
+                f'</li>'
+            )
+        nia_coverage_html = (
+            '<h3 style="color:#a5b4fc;font-size:12px;text-transform:uppercase;letter-spacing:.1em;'
+            'margin:24px 0 8px">Indexed by Nia '
+            f'<span style="color:#52525b;text-transform:none;letter-spacing:0">'
+            f'({len(nia_queried)} of {len(nia_indexed)} queried)</span></h3>'
+            '<ul style="font-size:13px;line-height:1.6;list-style:none;padding-left:0">'
+            f'{"".join(rows)}</ul>'
+        )
+    else:
+        nia_coverage_html = ""
 
     html = f"""
     <div style="font-family:monospace;max-width:640px;margin:0 auto;background:#09090b;color:#e4e4e7;padding:32px;border-radius:8px;">
@@ -1101,6 +1131,8 @@ def send_verdict_email(
       <ul style="color:#a1a1aa;font-size:13px;line-height:1.8">
         {"".join(top_receipts) or "<li>No specific receipts found.</li>"}
       </ul>
+
+      {nia_coverage_html}
 
       <h3 style="color:#a1a1aa;font-size:12px;text-transform:uppercase;letter-spacing:.1em;margin:24px 0 8px">Recent Activity</h3>
       {activity_html}

@@ -173,6 +173,40 @@ export default function ResultsPanel({
         </div>
       </div>
 
+      {/* Nia coverage */}
+      {result.niaIndexedRepos && result.niaIndexedRepos.length > 0 && (
+        <div className="bg-zinc-900 border border-indigo-900/40 rounded p-5 space-y-2">
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-indigo-300 uppercase tracking-widest">
+              Indexed by Nia
+            </p>
+            <span className="text-[10px] text-zinc-500">
+              {(result.niaQueriedRepos?.length ?? 0)} of {result.niaIndexedRepos.length} queried
+            </span>
+          </div>
+          <ul className="space-y-1">
+            {result.niaIndexedRepos.map((slug) => {
+              const queried = result.niaQueriedRepos?.includes(slug);
+              return (
+                <li key={slug} className="flex items-center gap-2 text-xs">
+                  <span className={queried ? "text-indigo-400" : "text-zinc-600"}>
+                    {queried ? "✓" : "·"}
+                  </span>
+                  <a
+                    href={`https://github.com/${slug}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className={`font-mono ${queried ? "text-indigo-300 hover:text-indigo-200" : "text-zinc-500 hover:text-zinc-400"}`}
+                  >
+                    {slug}
+                  </a>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+
       {/* Ask the codebase */}
       <AskCodebase username={result.candidate} repos={result.analyzedRepos} />
 
