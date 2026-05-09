@@ -96,6 +96,8 @@ def _gmail_parse_message(msg: dict) -> dict:
     return {
         "message_id": msg["id"],
         "thread_id": msg["threadId"],
+        "rfc_message_id": headers.get("Message-ID") or headers.get("Message-Id", ""),
+        "references": headers.get("References", ""),
         "from_email": headers.get("From", ""),
         "subject": headers.get("Subject", ""),
         "body_text": _gmail_extract_body(msg["payload"]),
@@ -129,14 +131,72 @@ def mark_as_read(message_id: str) -> None:
     ).execute()
 
 
-def send_gmail(to_email: str, subject: str, html_body: str) -> None:
+def get_my_email() -> str:
+    """Return the inbox email this agent is authenticated as."""
+    svc = _gmail_service()
+    return svc.users().getProfile(userId="me").execute().get("emailAddress", "")
+
+
+def github_user_exists(username: str) -> bool:
+    """Quick existence check for a GitHub user. Returns False on 404."""
+    try:
+        r = requests.get(
+            f"https://api.github.com/users/{username}",
+            headers={
+                "Authorization": f"Bearer {os.environ['GITHUB_PAT']}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=10,
+        )
+    except Exception:
+        return True  # if we can't tell, assume exists and let the pipeline try
+    if r.status_code == 404:
+        return False
+    return True
+
+
+def thread_has_my_reply(thread_id: str, my_email: str) -> bool:
+    """True if any message in this Gmail thread was sent by us. Used as dedup lock."""
+    if not thread_id:
+        return False
+    svc = _gmail_service()
+    try:
+        thread = svc.users().threads().get(
+            userId="me", id=thread_id, format="metadata",
+            metadataHeaders=["From"],
+        ).execute()
+    except Exception:
+        return False
+    me = my_email.lower()
+    for msg in thread.get("messages", []):
+        headers = msg.get("payload", {}).get("headers", [])
+        from_h = next((h["value"] for h in headers if h["name"].lower() == "from"), "")
+        if me in from_h.lower():
+            return True
+    return False
+
+
+def send_gmail(
+    to_email: str,
+    subject: str,
+    html_body: str,
+    thread_id: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+    references: Optional[str] = None,
+) -> None:
     svc = _gmail_service()
     msg = MIMEMultipart("alternative")
     msg["To"] = to_email
     msg["Subject"] = subject
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = (references + " " if references else "") + in_reply_to
     msg.attach(MIMEText(html_body, "html"))
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-    svc.users().messages().send(userId="me", body={"raw": raw}).execute()
+    body = {"raw": raw}
+    if thread_id:
+        body["threadId"] = thread_id
+    svc.users().messages().send(userId="me", body=body).execute()
 
 
 def extract_github_username(text: str) -> Optional[str]:
@@ -279,7 +339,8 @@ def extract_claims_from_email(email_body: str, resume_text: str) -> dict:
                 '  "claims": ["<specific verifiable claim 1>", "<claim 2>", ...]\n'
                 "}\n\n"
                 "Claims should be specific, verifiable assertions about skills, experience, "
-                "projects, or seniority. Extract 3–6 claims.\n\n"
+                "projects, or seniority. Extract the 3 most important verifiable claims. "
+                "Do not exceed 3 claims.\n\n"
                 + combined
             ),
         }],
@@ -321,7 +382,10 @@ def index_github_repos(github_username: str) -> dict[str, str]:
         headers=gh_headers,
         params={"type": "owner", "sort": "pushed", "per_page": 100},
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        # Don't raise — sub-function exceptions get swallowed by Tensorlake.
+        # The caller pre-validates the user via github_user_exists().
+        return {}
     repos = [r for r in resp.json() if not r["fork"]]
     repos.sort(key=lambda r: (-r["stargazers_count"],))
     repos = repos[:3]
@@ -370,7 +434,8 @@ def index_github_repos(github_username: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 GITHUB_API = "https://api.github.com"
-MAX_TOOL_CALLS = 8
+MAX_TOOL_CALLS = 4
+MAX_CLAIMS = 3
 
 
 def _gh_headers() -> dict:
@@ -378,6 +443,43 @@ def _gh_headers() -> dict:
         "Authorization": f"Bearer {os.environ['GITHUB_PAT']}",
         "Accept": "application/vnd.github+json",
     }
+
+
+def _fix_receipt_urls(
+    receipts: list[dict], username: str, repo_full_names: dict[str, str]
+) -> list[dict]:
+    """
+    Ensure every receipt URL is a fully-qualified github.com/<owner>/<repo>/...
+    URL. The model sometimes drops the owner segment.
+    """
+    fixed = []
+    for r in receipts:
+        url = (r.get("url") or "").strip()
+        if not url:
+            fixed.append(r)
+            continue
+        if url.startswith("https://github.com/") or url.startswith("http://github.com/"):
+            # Validate owner is present (path has at least owner/repo)
+            path = url.split("github.com/", 1)[1].strip("/")
+            parts = path.split("/")
+            if len(parts) >= 2:
+                fixed.append(r)
+                continue
+            # /reponame only — prepend owner
+            repo = parts[0] if parts else ""
+            full = repo_full_names.get(repo) or f"{username}/{repo}"
+            r = {**r, "url": f"https://github.com/{full}"}
+            fixed.append(r)
+            continue
+        # Bare repo name or path — try to infer
+        if url.startswith("/"):
+            url = url[1:]
+        head = url.split("/", 1)[0]
+        full = repo_full_names.get(head) or f"{username}/{head}"
+        rest = url[len(head):]
+        r = {**r, "url": f"https://github.com/{full}{rest}"}
+        fixed.append(r)
+    return fixed
 
 
 def _nia_query(index_id: str, query: str, top_k: int = 5) -> list[dict]:
@@ -418,6 +520,9 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
     from openai import OpenAI
     client = OpenAI()
 
+    # Cap claim count to control token spend.
+    claims = claims[:MAX_CLAIMS]
+
     # Fetch repo metadata for context
     gh_resp = requests.get(
         f"{GITHUB_API}/users/{github_username}/repos",
@@ -425,7 +530,9 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
         params={"type": "owner", "sort": "pushed", "per_page": 10},
     )
     all_repos = [r for r in (gh_resp.json() if gh_resp.ok else []) if not r.get("fork")]
-    repo_names = [r["name"] for r in all_repos[:3]]
+    top_repos = all_repos[:3]
+    repo_names = [r["name"] for r in top_repos]
+    repo_full_names = {r["name"]: r["full_name"] for r in top_repos}
 
     tools = [
         {
@@ -515,10 +622,19 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
         },
     ]
 
+    repo_url_lines = "\n".join(
+        f"  - {name}  →  https://github.com/{full}"
+        for name, full in repo_full_names.items()
+    )
     system = (
-        f"You are LARPbot, an AI investigator that verifies developer claims against their actual GitHub code.\n"
-        f"Repositories: {', '.join(repo_names)}\n"
-        f"Investigate each claim, gather evidence, then call submit_verdict. Be specific. Cap tool use to {MAX_TOOL_CALLS} calls per claim."
+        "You are LARPbot, an AI investigator that verifies developer claims against their actual GitHub code.\n"
+        f"GitHub user: {github_username}\n"
+        "Available repositories (use the FULL URL when filling receipts.url):\n"
+        f"{repo_url_lines}\n\n"
+        "When you submit_verdict, every receipt MUST have a fully-qualified GitHub URL "
+        f"like https://github.com/{github_username}/<repo>/... — never just /repo or a bare path.\n"
+        f"Investigate each claim, gather evidence, then call submit_verdict. "
+        f"Be efficient — cap tool use at {MAX_TOOL_CALLS} calls per claim."
     )
 
     verified_claims = []
@@ -534,7 +650,7 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
         while claim_result is None:
             resp = client.chat.completions.create(
                 model="gpt-4o",
-                max_tokens=4096,
+                max_tokens=1024,
                 tools=tools,
                 messages=messages,
             )
@@ -550,13 +666,14 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
                 inp = json.loads(tool_call.function.arguments)
 
                 if name == "submit_verdict":
+                    receipts = _fix_receipt_urls(inp.get("receipts", []), github_username, repo_full_names)
                     claim_result = {
                         "claim": claim,
                         "verdict": inp["verdict"],
                         "confidence": inp["confidence"],
                         "summary": inp["summary"],
                         "evidence": inp["evidence"],
-                        "receipts": inp.get("receipts", []),
+                        "receipts": receipts,
                         "whatToAskNext": inp["whatToAskNext"],
                     }
                     break
@@ -601,6 +718,9 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
     )
     overall = json.loads(_strip_json(synth_resp.choices[0].message.content.strip()))
 
+    # Collect recent activity (commits) across the analyzed repos for the report.
+    recent_activity = _fetch_recent_activity(top_repos[:3], limit_per_repo=5)
+
     return {
         "candidate": github_username,
         "githubUrl": f"https://github.com/{github_username}",
@@ -610,8 +730,51 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
         "subscores": overall["subscores"],
         "claims": verified_claims,
         "redemption": overall["redemption"],
+        "recentActivity": recent_activity,
         "analyzedAt": __import__("datetime").datetime.utcnow().isoformat() + "Z",
     }
+
+
+def _fetch_recent_activity(repos: list[dict], limit_per_repo: int = 5) -> list[dict]:
+    """
+    Returns a list of {repo, fullName, htmlUrl, commits: [{sha, date, message, url}]}
+    for the given repos, hitting GitHub once per repo.
+    """
+    out = []
+    for repo in repos:
+        full = repo.get("full_name") or ""
+        if not full:
+            continue
+        try:
+            r = requests.get(
+                f"{GITHUB_API}/repos/{full}/commits",
+                headers=_gh_headers(),
+                params={"per_page": limit_per_repo},
+                timeout=10,
+            )
+            if not r.ok:
+                continue
+            commits = []
+            for c in r.json()[:limit_per_repo]:
+                sha = c.get("sha", "")[:7]
+                msg = (c.get("commit", {}).get("message") or "").splitlines()[0][:120]
+                date = (c.get("commit", {}).get("author", {}).get("date") or "")[:10]
+                commits.append({
+                    "sha": sha,
+                    "date": date,
+                    "message": msg,
+                    "url": c.get("html_url", ""),
+                })
+            if commits:
+                out.append({
+                    "repo": repo.get("name", ""),
+                    "fullName": full,
+                    "htmlUrl": repo.get("html_url", f"https://github.com/{full}"),
+                    "commits": commits,
+                })
+        except Exception:
+            continue
+    return out
 
 
 def _run_tool(name: str, inp: dict, index_ids: dict, username: str, repos: list) -> str:
@@ -631,12 +794,12 @@ def _run_tool(name: str, inp: dict, index_ids: dict, username: str, repos: list)
             r = requests.get(
                 f"{GITHUB_API}/repos/{full_name}/commits",
                 headers=_gh_headers(),
-                params={"per_page": 20},
+                params={"per_page": 10},
             )
             commits = r.json() if r.ok else []
             return "\n".join(
-                f"{c['sha'][:7]} {c['commit']['committer']['date'][:10]} {c['commit']['message'].splitlines()[0][:100]}"
-                for c in commits
+                f"{c['sha'][:7]} {c['commit']['committer']['date'][:10]} {c['commit']['message'].splitlines()[0][:80]}"
+                for c in commits[:10]
             )
 
         elif name == "github_tree":
@@ -648,7 +811,7 @@ def _run_tool(name: str, inp: dict, index_ids: dict, username: str, repos: list)
             if not r.ok:
                 return "Could not fetch tree"
             paths = [f["path"] for f in r.json().get("tree", []) if f.get("type") == "blob"]
-            return "\n".join(paths[:200])
+            return "\n".join(paths[:50])
 
         elif name == "github_file":
             r = requests.get(
@@ -659,8 +822,8 @@ def _run_tool(name: str, inp: dict, index_ids: dict, username: str, repos: list)
                 return "File not found"
             data = r.json()
             if data.get("encoding") == "base64":
-                return base64.b64decode(data["content"]).decode("utf-8", errors="replace")[:4000]
-            return data.get("content", "")
+                return base64.b64decode(data["content"]).decode("utf-8", errors="replace")[:1500]
+            return (data.get("content", "") or "")[:1500]
 
     except Exception as e:
         return f"Error: {e}"
@@ -689,7 +852,15 @@ def _fallback_claim(claim: str) -> dict:
     secrets=["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"],
     timeout=30,
 )
-def send_verdict_email(to_email: str, candidate_username: str, verdict: dict) -> None:
+def send_verdict_email(
+    to_email: str,
+    candidate_username: str,
+    verdict: dict,
+    thread_id: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+    references: Optional[str] = None,
+    original_subject: Optional[str] = None,
+) -> None:
     top_receipts = []
     for cv in verdict.get("claims", []):
         for r in cv.get("receipts", [])[:1]:
@@ -703,13 +874,30 @@ def send_verdict_email(to_email: str, candidate_username: str, verdict: dict) ->
         if cv.get("whatToAskNext")
     )
 
+    # Recent activity blocks
+    activity_blocks = []
+    for entry in verdict.get("recentActivity", []) or []:
+        commits_html = "".join(
+            f'<li><a href="{c["url"]}" style="color:#a1a1aa">{c["sha"]}</a> '
+            f'<span style="color:#52525b">{c["date"]}</span> — {c["message"]}</li>'
+            for c in entry.get("commits", [])
+        )
+        activity_blocks.append(
+            f'<div style="margin-bottom:14px">'
+            f'<a href="{entry["htmlUrl"]}" style="color:#e4e4e7;font-weight:bold;text-decoration:none">'
+            f'{entry["repo"]}</a>'
+            f'<ul style="color:#a1a1aa;font-size:13px;line-height:1.7;margin:6px 0 0;padding-left:18px">'
+            f'{commits_html}</ul></div>'
+        )
+    activity_html = "".join(activity_blocks) or '<p style="color:#71717a;font-size:13px">No recent commits found.</p>'
+
     score = verdict.get("overallLarpScore", "?")
     verdict_text = verdict.get("overallVerdict", "")
     score_color = "#22c55e" if score < 30 else "#eab308" if score < 60 else "#ef4444"
 
     html = f"""
     <div style="font-family:monospace;max-width:640px;margin:0 auto;background:#09090b;color:#e4e4e7;padding:32px;border-radius:8px;">
-      <h2 style="color:#fff;margin:0 0 4px">LARPbot Report: <a href="https://github.com/{candidate_username}" style="color:#a1a1aa">{candidate_username}</a></h2>
+      <h2 style="color:#fff;margin:0 0 4px">LARP Report: <a href="https://github.com/{candidate_username}" style="color:#a1a1aa">{candidate_username}</a></h2>
       <p style="color:#71717a;margin:0 0 24px">Automated candidate verification</p>
 
       <div style="background:#18181b;border:1px solid #27272a;border-radius:6px;padding:20px;margin-bottom:24px">
@@ -725,6 +913,9 @@ def send_verdict_email(to_email: str, candidate_username: str, verdict: dict) ->
         {"".join(top_receipts) or "<li>No specific receipts found.</li>"}
       </ul>
 
+      <h3 style="color:#a1a1aa;font-size:12px;text-transform:uppercase;letter-spacing:.1em;margin:24px 0 8px">Recent Activity</h3>
+      {activity_html}
+
       <h3 style="color:#a1a1aa;font-size:12px;text-transform:uppercase;letter-spacing:.1em;margin:24px 0 8px">What to Ask Next</h3>
       <ul style="color:#a1a1aa;font-size:13px;line-height:1.8">{questions}</ul>
 
@@ -734,10 +925,18 @@ def send_verdict_email(to_email: str, candidate_username: str, verdict: dict) ->
     </div>
     """
 
+    # Subject puts "LARP Report" first; original applicant subject is appended for context.
+    # Threading is preserved via In-Reply-To + threadId, not the subject string.
+    suffix = f" · re: {original_subject}" if original_subject else ""
+    subject = f"LARP Report: {candidate_username} — Score {score}/100{suffix}"
+
     send_gmail(
         to_email=to_email,
-        subject=f"LARPbot: {candidate_username} — LARP Score {score}/100",
+        subject=subject,
         html_body=html,
+        thread_id=thread_id,
+        in_reply_to=in_reply_to,
+        references=references,
     )
 
 
@@ -751,7 +950,15 @@ def send_verdict_email(to_email: str, candidate_username: str, verdict: dict) ->
     secrets=["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"],
     timeout=30,
 )
-def send_error_email(to_email: str, candidate_username: str, reason: str) -> None:
+def send_error_email(
+    to_email: str,
+    candidate_username: str,
+    reason: str,
+    thread_id: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+    references: Optional[str] = None,
+    original_subject: Optional[str] = None,
+) -> None:
     html = f"""
     <div style="font-family:monospace;max-width:640px;margin:0 auto;background:#09090b;color:#e4e4e7;padding:32px;border-radius:8px;">
       <h2 style="color:#fff;margin:0 0 4px">LARPbot: Analysis Failed</h2>
@@ -772,10 +979,15 @@ def send_error_email(to_email: str, candidate_username: str, reason: str) -> Non
     </div>
     """
 
+    suffix = f" · re: {original_subject}" if original_subject else ""
+
     send_gmail(
         to_email=to_email,
-        subject=f"LARPbot: Could not analyze {candidate_username}",
+        subject=f"LARP Report: {candidate_username} — Analysis Failed{suffix}",
         html_body=html,
+        thread_id=thread_id,
+        in_reply_to=in_reply_to,
+        references=references,
     )
 
 
@@ -807,53 +1019,88 @@ def poll_recruiting_inbox() -> dict:
     processed = []
     skipped_cached = []
 
+    # The recruiter is the inbox owner — verdicts go back into the same thread
+    # so they appear directly under the applicant's email in the recruiter's inbox.
+    # We do NOT mark applicant emails as read; the recruiter wants them visible.
+    recruiter_email = get_my_email()
+
     for email in emails:
-        from_email = email["from_email"]
         body = email["body_text"]
+        thread_id = email.get("thread_id")
+        rfc_id = email.get("rfc_message_id") or None
+        refs = email.get("references") or None
+        orig_subject = email.get("subject") or None
 
         username = extract_github_username(body)
         if not username:
-            mark_as_read(email["message_id"])
             continue
 
-        # Check durable memory — skip if already analyzed
+        # Dedup gate #1: if the Gmail thread already contains a message from us,
+        # we've already replied. Skip. This protects against Pub/Sub at-least-once
+        # delivery causing concurrent invocations.
+        if thread_has_my_reply(thread_id, recruiter_email):
+            skipped_cached.append(f"{username} (already replied)")
+            continue
+
+        # Pre-validate GitHub user exists. If not, send a clean error email
+        # in-thread and skip the heavyweight pipeline.
+        if not github_user_exists(username):
+            send_error_email(
+                recruiter_email, username,
+                f"GitHub user '{username}' does not exist. Please verify the URL.",
+                thread_id=thread_id, in_reply_to=rfc_id,
+                references=refs, original_subject=orig_subject,
+            )
+            continue
+
         cached = memory_get_candidate(username)
         if cached:
             skipped_cached.append(username)
-            mark_as_read(email["message_id"])
-            send_verdict_email(from_email, username, cached)
+            # Re-check right before send in case a parallel invocation just replied
+            if thread_has_my_reply(thread_id, recruiter_email):
+                continue
+            send_verdict_email(
+                recruiter_email, username, cached,
+                thread_id=thread_id, in_reply_to=rfc_id,
+                references=refs, original_subject=orig_subject,
+            )
             continue
 
         try:
-            # Extract structured claims from email body
             extraction = extract_claims_from_email(body, "")
             github_username = extraction.get("github_username") or username
             claims = extraction.get("claims") or []
 
             if not claims:
-                mark_as_read(email["message_id"])
                 continue
 
-            # Index repos and verify claims
             index_ids = index_github_repos(github_username)
             verdict = verify_claims(github_username, claims, index_ids)
 
-            # Store in durable memory
             memory_store_candidate(github_username, verdict)
 
-            # Send verdict to recruiter
-            send_verdict_email(from_email, github_username, verdict)
+            # Dedup gate #2: another invocation may have finished and sent during
+            # our 50s of processing. Re-check the thread immediately before send.
+            if thread_has_my_reply(thread_id, recruiter_email):
+                skipped_cached.append(f"{github_username} (raced)")
+                continue
+
+            send_verdict_email(
+                recruiter_email, github_username, verdict,
+                thread_id=thread_id, in_reply_to=rfc_id,
+                references=refs, original_subject=orig_subject,
+            )
             processed.append(github_username)
 
         except Exception as e:
+            if thread_has_my_reply(thread_id, recruiter_email):
+                continue
             send_error_email(
-                from_email,
-                username,
+                recruiter_email, username,
                 f"An unexpected error occurred during analysis: {e}",
+                thread_id=thread_id, in_reply_to=rfc_id,
+                references=refs, original_subject=orig_subject,
             )
-
-        finally:
-            mark_as_read(email["message_id"])
 
     return {
         "emails_checked": len(emails),
