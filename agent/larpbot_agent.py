@@ -773,6 +773,33 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
         },
     ]
 
+    # Tracks per-repo Nia query success. A repo is added to `queried` when
+    # nia_search returns a substantive answer for it. Surfaced as
+    # `niaVerified` (boolean) and `niaQueriedRepos` (slug list) on the verdict.
+    nia_used: dict = {"queried": set()}
+
+    # Pre-pass: query Nia for every indexed repo with a single comprehensive
+    # claim-aware question. Results are injected into the system prompt so the
+    # agent has Nia's view of every repo from the start, and every indexed
+    # repo gets at least one query (✓ in the Nia coverage block).
+    nia_briefings: dict[str, dict] = {}
+    if claims and repo_full_names:
+        briefing_query = (
+            f"Considering these claims about the developer: "
+            + "; ".join(f'"{c}"' for c in claims)
+            + ". What evidence in this codebase supports or contradicts each? "
+            "What is the actual implementation depth (real code vs scaffolding)?"
+        )
+        for slug in repo_full_names.values():
+            try:
+                r = _nia_query(slug, briefing_query)
+                ans = (r.get("answer") or "").strip()
+                if ans and not ans.startswith("(Nia "):
+                    nia_briefings[slug] = r
+                    nia_used["queried"].add(slug)
+            except Exception as e:
+                print(f"Nia briefing failed for {slug}: {e}")
+
     repo_url_lines = "\n".join(
         f"  - {name}  →  https://github.com/{full}"
         for name, full in repo_full_names.items()
@@ -815,33 +842,6 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
         f"Investigate each claim, gather evidence, then call submit_verdict. "
         f"Be efficient — cap tool use at {MAX_TOOL_CALLS} calls per claim."
     )
-
-    # Tracks per-repo Nia query success. A repo is added to `queried` when
-    # nia_search returns a substantive answer for it. Surfaced as
-    # `niaVerified` (boolean) and `niaQueriedRepos` (slug list) on the verdict.
-    nia_used: dict = {"queried": set()}
-
-    # Pre-pass: query Nia for every indexed repo with a single comprehensive
-    # claim-aware question. Results are injected into the system prompt so the
-    # agent has Nia's view of every repo from the start, and every indexed
-    # repo gets at least one query (✓ in the Nia coverage block).
-    nia_briefings: dict[str, dict] = {}
-    if claims and repo_full_names:
-        briefing_query = (
-            f"Considering these claims about the developer: "
-            + "; ".join(f'"{c}"' for c in claims)
-            + ". What evidence in this codebase supports or contradicts each? "
-            "What is the actual implementation depth (real code vs scaffolding)?"
-        )
-        for slug in repo_full_names.values():
-            try:
-                r = _nia_query(slug, briefing_query)
-                ans = (r.get("answer") or "").strip()
-                if ans and not ans.startswith("(Nia "):
-                    nia_briefings[slug] = r
-                    nia_used["queried"].add(slug)
-            except Exception as e:
-                print(f"Nia briefing failed for {slug}: {e}")
 
     verified_claims = []
 
