@@ -132,10 +132,38 @@ interface AskAnswer {
 }
 
 function mergeData(candidates: CandidateRow[], threads: InboxThread[]): MergedRow[] {
-  const byUser = new Map<string, MergedRow>();
+  const candidatesByUser = new Map(
+    candidates.map((candidate) => [candidate.github_username.toLowerCase(), candidate])
+  );
+  const usersRepresentedByThreads = new Set<string>();
+  const rows: MergedRow[] = [];
+
+  for (const t of threads) {
+    const u = (t.githubUsername || "").toLowerCase();
+    if (u) {
+      usersRepresentedByThreads.add(u);
+    }
+    const candidate = u ? candidatesByUser.get(u) : undefined;
+    rows.push({
+      username: t.githubUsername || candidate?.github_username || "(no github)",
+      fromEmail: t.fromEmail,
+      fromName: t.fromName,
+      subject: t.subject,
+      larpScore: t.reportScore ?? candidate?.larp_score ?? null,
+      threadId: t.threadId,
+      date: t.date || candidate?.analyzed_at || "",
+      hasReport: t.hasReport || Boolean(candidate),
+      reportInEmail: t.hasReport,
+      reportSubject: t.reportSubject,
+      reportText: t.reportText,
+      reportHtml: t.reportHtml,
+    });
+  }
 
   for (const c of candidates) {
-    byUser.set(c.github_username.toLowerCase(), {
+    const key = c.github_username.toLowerCase();
+    if (usersRepresentedByThreads.has(key)) continue;
+    rows.push({
       username: c.github_username,
       fromEmail: null,
       fromName: null,
@@ -151,42 +179,7 @@ function mergeData(candidates: CandidateRow[], threads: InboxThread[]): MergedRo
     });
   }
 
-  for (const t of threads) {
-    const u = (t.githubUsername || "").toLowerCase();
-    const existing = u ? byUser.get(u) : undefined;
-    if (existing) {
-      existing.fromEmail = t.fromEmail;
-      existing.fromName = t.fromName;
-      existing.subject = t.subject;
-      existing.threadId = t.threadId;
-      existing.hasReport = existing.hasReport || t.hasReport;
-      existing.reportInEmail = existing.reportInEmail || t.hasReport;
-      existing.reportSubject = existing.reportSubject || t.reportSubject;
-      existing.reportText = existing.reportText || t.reportText;
-      existing.reportHtml = existing.reportHtml || t.reportHtml;
-      if (existing.larpScore === null && t.reportScore !== null) existing.larpScore = t.reportScore;
-      if (!existing.date) existing.date = t.date;
-    } else {
-      // Pending — emailed in but no LARP report yet
-      const key = u || `__thread_${t.threadId}`;
-      byUser.set(key, {
-        username: t.githubUsername || "(no github)",
-        fromEmail: t.fromEmail,
-        fromName: t.fromName,
-        subject: t.subject,
-        larpScore: t.reportScore,
-        threadId: t.threadId,
-        date: t.date,
-        hasReport: t.hasReport,
-        reportInEmail: t.hasReport,
-        reportSubject: t.reportSubject,
-        reportText: t.reportText,
-        reportHtml: t.reportHtml,
-      });
-    }
-  }
-
-  return Array.from(byUser.values()).sort(
+  return rows.sort(
     (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
   );
 }
