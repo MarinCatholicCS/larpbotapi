@@ -925,7 +925,7 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
     overall = json.loads(_strip_json(synth_resp.choices[0].message.content.strip()))
 
     # Collect recent activity (commits) across the analyzed repos for the report.
-    recent_activity = _fetch_recent_activity(top_repos[:3], limit_per_repo=5)
+    recent_activity = _fetch_recent_activity(all_repos[:3], limit_per_repo=5)
 
     nia_queried_repos = sorted(nia_used["queried"])
 
