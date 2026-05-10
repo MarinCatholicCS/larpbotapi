@@ -12,11 +12,12 @@ function stripJson(text: string): string {
 }
 
 const client = new OpenAI();
+const FAST_DEMO_MODE = process.env.FAST_DEMO_MODE !== "0";
 
 export async function parseClaims(claimsText: string): Promise<string[]> {
   const resp = await client.chat.completions.create({
-    model: "gpt-4o",
-    max_tokens: 1024,
+    model: FAST_DEMO_MODE ? "gpt-4o-mini" : "gpt-4o",
+    max_tokens: 512,
     messages: [
       {
         role: "user",
@@ -44,7 +45,7 @@ interface AgentContext {
   niaUsed?: { queried: Set<string> };
 }
 
-const MAX_TOOL_CALLS = 8;
+const MAX_TOOL_CALLS = FAST_DEMO_MODE ? 2 : 8;
 
 export async function verifyClaim(ctx: AgentContext): Promise<ClaimVerification> {
   const tools: OpenAI.ChatCompletionTool[] = [
@@ -164,11 +165,10 @@ Don't be mean for its own sake — just honest. Cap tool use to ${MAX_TOOL_CALLS
   const collectedReceipts: Receipt[] = [];
   let toolCallCount = 0;
 
-  // eslint-disable-next-line no-constant-condition
   while (true) {
     const response = await client.chat.completions.create({
-      model: "gpt-4o",
-      max_tokens: 4096,
+      model: FAST_DEMO_MODE ? "gpt-4o-mini" : "gpt-4o",
+      max_tokens: FAST_DEMO_MODE ? 1400 : 4096,
       tools,
       messages,
     });
@@ -306,8 +306,8 @@ export async function synthesizeOverall(
     .join("\n");
 
   const resp = await client.chat.completions.create({
-    model: "gpt-4o",
-    max_tokens: 1024,
+    model: FAST_DEMO_MODE ? "gpt-4o-mini" : "gpt-4o",
+    max_tokens: 700,
     messages: [
       {
         role: "user",

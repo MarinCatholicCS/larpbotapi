@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { LogOut, ExternalLink, RefreshCw, Inbox, Mail } from "lucide-react";
+import { LogOut, ExternalLink, RefreshCw, Inbox, Mail, Send } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { AnalysisResult } from "@/lib/types";
 
@@ -23,6 +23,7 @@ interface InboxThread {
   reportScore: number | null;
   reportSubject: string | null;
   reportText: string | null;
+  reportHtml: string | null;
   hasReport: boolean;
 }
 
@@ -32,20 +33,6 @@ function scoreColor(n: number | null) {
   if (n >= 40) return "#f97316";
   return "#4ade80";
 }
-
-function verdictFromScore(n: number | null): "CONTRADICTED" | "UNVERIFIED" | "SUPPORTED" | "PENDING" {
-  if (n === null) return "PENDING";
-  if (n >= 70) return "CONTRADICTED";
-  if (n >= 40) return "UNVERIFIED";
-  return "SUPPORTED";
-}
-
-const verdictStyle: Record<string, string> = {
-  CONTRADICTED: "bg-red-500/10 text-red-200 border border-red-400/20",
-  UNVERIFIED: "bg-amber-500/10 text-amber-200 border border-amber-400/20",
-  SUPPORTED: "bg-emerald-500/10 text-emerald-200 border border-emerald-400/20",
-  PENDING: "bg-slate-700/40 text-slate-300 border border-slate-600/50",
-};
 
 const REPORT_HEADINGS = [
   "Receipts",
@@ -128,6 +115,20 @@ interface MergedRow {
   reportInEmail: boolean;
   reportSubject: string | null;
   reportText: string | null;
+  reportHtml: string | null;
+}
+
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+  citations?: string[];
+}
+
+interface AskAnswer {
+  repo: string;
+  slug: string;
+  answer: string;
+  citations: string[];
 }
 
 function mergeData(candidates: CandidateRow[], threads: InboxThread[]): MergedRow[] {
@@ -146,6 +147,7 @@ function mergeData(candidates: CandidateRow[], threads: InboxThread[]): MergedRo
       reportInEmail: false,
       reportSubject: null,
       reportText: null,
+      reportHtml: null,
     });
   }
 
@@ -161,6 +163,7 @@ function mergeData(candidates: CandidateRow[], threads: InboxThread[]): MergedRo
       existing.reportInEmail = existing.reportInEmail || t.hasReport;
       existing.reportSubject = existing.reportSubject || t.reportSubject;
       existing.reportText = existing.reportText || t.reportText;
+      existing.reportHtml = existing.reportHtml || t.reportHtml;
       if (existing.larpScore === null && t.reportScore !== null) existing.larpScore = t.reportScore;
       if (!existing.date) existing.date = t.date;
     } else {
@@ -178,6 +181,7 @@ function mergeData(candidates: CandidateRow[], threads: InboxThread[]): MergedRo
         reportInEmail: t.hasReport,
         reportSubject: t.reportSubject,
         reportText: t.reportText,
+        reportHtml: t.reportHtml,
       });
     }
   }
@@ -244,7 +248,7 @@ export default function Dashboard() {
       setSelected({
         row,
         result: null,
-        reportError: row.reportText ? null : "No structured report is available yet.",
+        reportError: row.reportText || row.reportHtml ? null : "No structured report is available yet.",
       });
       return;
     }
@@ -262,7 +266,7 @@ export default function Dashboard() {
         setSelected({
           row,
           result: null,
-          reportError: row.reportText
+          reportError: row.reportText || row.reportHtml
             ? null
             : data.error || "Structured report was not found in agent memory.",
         });
@@ -271,7 +275,7 @@ export default function Dashboard() {
       setSelected({
         row,
         result: null,
-        reportError: row.reportText ? null : "Could not load the structured report from agent memory.",
+        reportError: row.reportText || row.reportHtml ? null : "Could not load the structured report from agent memory.",
       });
     }
   }
@@ -392,7 +396,6 @@ export default function Dashboard() {
                   <th className="text-left px-5 py-3 font-semibold">Applicant</th>
                   <th className="text-left px-5 py-3 font-semibold">GitHub</th>
                   <th className="text-left px-5 py-3 font-semibold">Email subject</th>
-                  <th className="text-left px-5 py-3 font-semibold">Verdict</th>
                   <th className="text-left px-5 py-3 font-semibold">LARP score</th>
                   <th className="text-left px-5 py-3 font-semibold">Date</th>
                   <th className="px-5 py-3" />
@@ -401,23 +404,21 @@ export default function Dashboard() {
               <tbody>
                 {loading && (
                   <tr>
-                    <td colSpan={7} className="px-5 py-12 text-center text-slate-500 text-sm">
+                    <td colSpan={6} className="px-5 py-12 text-center text-slate-500 text-sm">
                       Loading…
                     </td>
                   </tr>
                 )}
                 {!loading && rows.length === 0 && (
                   <tr>
-                    <td colSpan={7} className="px-5 py-12 text-center text-slate-500 text-sm">
+                    <td colSpan={6} className="px-5 py-12 text-center text-slate-500 text-sm">
                       No applicants yet. Recruiters email{" "}
                       <span className="text-slate-400">{inbox}</span> with a
                       github.com/&lt;user&gt; URL to get started.
                     </td>
                   </tr>
                 )}
-                {rows.map((r, i) => {
-                  const verdict = verdictFromScore(r.larpScore);
-                  return (
+                {rows.map((r, i) => (
                     <tr
                       key={r.threadId || r.username || i}
                       className={cn(
@@ -458,16 +459,6 @@ export default function Dashboard() {
                         {r.subject || "—"}
                       </td>
                       <td className="px-5 py-3.5">
-                        <span
-                          className={cn(
-                            "px-2 py-0.5 rounded text-[0.65rem] font-bold uppercase tracking-wider",
-                            verdictStyle[verdict]
-                          )}
-                        >
-                          {verdict}
-                        </span>
-                      </td>
-                      <td className="px-5 py-3.5">
                         {r.larpScore !== null ? (
                           <div className="flex items-center gap-2">
                             <div className="w-16 h-1.5 bg-slate-700 rounded overflow-hidden">
@@ -499,8 +490,7 @@ export default function Dashboard() {
                         </span>
                       </td>
                     </tr>
-                  );
-                })}
+                ))}
               </tbody>
             </table>
           </div>
@@ -549,11 +539,11 @@ function ReportDrawer({
 }) {
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex justify-end"
+      className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-center justify-center p-6"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-3xl h-full bg-[#0b1120] border-l border-white/10 overflow-y-auto p-6 shadow-2xl shadow-black"
+        className="w-full max-w-5xl max-h-[92vh] bg-[#0b1120] border border-white/10 rounded-2xl overflow-y-auto p-6 shadow-2xl shadow-black"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between mb-4">
@@ -578,15 +568,19 @@ function ReportDrawer({
           </div>
         )}
 
-        {row.hasReport && !result && !reportError && !row.reportText && (
+        {row.hasReport && !result && !reportError && !row.reportText && !row.reportHtml && (
           <div className="text-sm text-slate-500">Loading report…</div>
         )}
 
-        {row.hasReport && !result && row.reportText && (
+        {row.hasReport && row.reportHtml && (
+          <EmailHtmlReport row={row} />
+        )}
+
+        {row.hasReport && !row.reportHtml && !result && row.reportText && (
           <EmailReportFallback row={row} />
         )}
 
-        {row.hasReport && !result && reportError && !row.reportText && (
+        {row.hasReport && !result && reportError && !row.reportText && !row.reportHtml && (
           <div className="bg-slate-800 border border-amber-900/70 rounded p-4 text-sm text-slate-300 space-y-2">
             <p className="font-semibold text-amber-300">Report email found</p>
             <p className="text-slate-400">
@@ -601,8 +595,217 @@ function ReportDrawer({
           </div>
         )}
 
-        {result && <InlineReport result={result} />}
+        {result && !row.reportHtml && <InlineReport result={result} />}
+
+        {row.username !== "(no github)" && (
+          <NiaCandidateChat
+            username={row.username}
+            repos={result?.niaIndexedRepos || result?.analyzedRepos || []}
+          />
+        )}
       </div>
+    </div>
+  );
+}
+
+function NiaCandidateChat({ username, repos }: { username: string; repos: string[] }) {
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      role: "assistant",
+      content:
+        "Ask a follow-up about this candidate's code. I will query Nia across their indexed GitHub repos and return citations when available.",
+    },
+  ]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const suggestions = [
+    "Does this person show backend depth?",
+    "Is there evidence of Rust experience?",
+    "What should I ask in the interview?",
+  ];
+
+  async function ask(raw: string = input) {
+    const query = raw.trim();
+    if (!query || loading) return;
+
+    setInput("");
+    setLoading(true);
+    setMessages((prev) => [...prev, { role: "user", content: query }]);
+
+    try {
+      const res = await fetch("/api/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, repos, query }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+      const answers = (data.perRepo || []) as AskAnswer[];
+      const useful = answers.filter((answer) => answer.answer);
+      const lines = (useful.length > 0 ? useful : answers).map((answer) => {
+        const label = answer.repo || answer.slug;
+        return `${label}: ${answer.answer || "(no answer)"}`;
+      });
+      const citations = answers.flatMap((answer) => answer.citations || []);
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: lines.join("\n\n") || "I checked Nia's indexed candidate context, but there was not enough evidence to answer that confidently.",
+          citations,
+        },
+      ]);
+    } catch {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "I checked Nia's indexed candidate context, but this follow-up needs more candidate evidence than is currently available.",
+        },
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <section className="mt-5 bg-white/[0.04] border border-white/10 rounded-xl overflow-hidden">
+      <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between gap-4">
+        <div>
+          <h3 className="text-sm font-semibold text-white">Clarify with Nia</h3>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Ask across {repos.length > 0 ? `${repos.length} known repo${repos.length === 1 ? "" : "s"}` : "their top GitHub repos"}.
+          </p>
+        </div>
+        <span className="text-[0.65rem] uppercase tracking-widest text-indigo-200 bg-indigo-400/10 border border-indigo-300/20 rounded-full px-2 py-1">
+          Nia
+        </span>
+      </div>
+
+      <div className="max-h-80 overflow-y-auto p-4 space-y-3">
+        {messages.map((message, i) => (
+          <div
+            key={i}
+            className={cn(
+              "rounded-xl px-3 py-2 text-sm leading-6 whitespace-pre-wrap",
+              message.role === "user"
+                ? "ml-10 bg-sky-400/10 border border-sky-300/20 text-sky-50"
+                : "mr-10 bg-slate-950/40 border border-white/10 text-slate-300"
+            )}
+          >
+            {message.content}
+            {message.citations && message.citations.length > 0 && (
+              <div className="mt-3 border-t border-white/10 pt-2 space-y-1">
+                {message.citations.slice(0, 5).map((citation) => (
+                  <a
+                    key={citation}
+                    href={`https://github.com/${citation}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="block text-xs text-sky-300 hover:text-sky-200"
+                  >
+                    {citation}
+                  </a>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+        {loading && (
+          <div className="mr-10 bg-slate-950/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-slate-500">
+            Asking Nia...
+          </div>
+        )}
+      </div>
+
+      <div className="px-4 pb-3 flex flex-wrap gap-2">
+        {suggestions.map((suggestion) => (
+          <button
+            key={suggestion}
+            onClick={() => ask(suggestion)}
+            disabled={loading}
+            className="text-xs text-slate-300 bg-slate-800/80 hover:bg-slate-700 disabled:opacity-50 border border-white/10 rounded-full px-3 py-1.5 transition-colors"
+          >
+            {suggestion}
+          </button>
+        ))}
+      </div>
+
+      <div className="p-4 border-t border-white/10 flex gap-2">
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && ask()}
+          disabled={loading}
+          placeholder="Ask a clarifying question..."
+          className="flex-1 bg-slate-950/60 border border-white/10 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-sky-400 disabled:opacity-60"
+        />
+        <button
+          onClick={() => ask()}
+          disabled={loading || !input.trim()}
+          className="inline-flex items-center justify-center bg-sky-500 hover:bg-sky-400 disabled:bg-slate-800 disabled:text-slate-600 text-white rounded-lg px-3 py-2 transition-colors"
+          aria-label="Ask Nia"
+        >
+          <Send size={16} />
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function EmailHtmlReport({ row }: { row: MergedRow }) {
+  const reportHtml = (row.reportHtml || "")
+    .replace(/<script\b[^>]*\/>/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<script\b[^>]*>[\s\S]*$/gi, "")
+    .replace(/\son\w+="[^"]*"/gi, "")
+    .replace(/\son\w+='[^']*'/gi, "")
+    .replace(/\son\w+=\S+/gi, "");
+  const srcDoc = `<!doctype html>
+<html>
+  <head>
+    <base target="_blank" />
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: #0b1120;
+        color: #e4e4e7;
+        font-family: Arial, Helvetica, sans-serif;
+      }
+      body { padding: 0; }
+      a { color: inherit; }
+    </style>
+  </head>
+  <body>${reportHtml}</body>
+</html>`;
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white/[0.04] border border-white/10 rounded-xl p-4">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-[0.65rem] uppercase tracking-widest text-slate-500 font-semibold">
+              Email-rendered report
+            </p>
+          </div>
+          {row.larpScore !== null && (
+            <div className="text-2xl font-semibold tabular-nums" style={{ color: scoreColor(row.larpScore) }}>
+              {row.larpScore}
+              <span className="text-sm text-slate-500">/100</span>
+            </div>
+          )}
+        </div>
+      </div>
+      <iframe
+        title="LARP email report"
+        srcDoc={srcDoc}
+        sandbox="allow-popups allow-popups-to-escape-sandbox"
+        className="w-full h-[980px] rounded-xl border border-white/10 bg-[#09090b]"
+      />
     </div>
   );
 }

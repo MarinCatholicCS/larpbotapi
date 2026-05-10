@@ -7,6 +7,7 @@ import { createJob, updateJob } from "@/lib/jobStore";
 import { AnalysisResult } from "@/lib/types";
 
 export const maxDuration = 60;
+const FAST_DEMO_MODE = process.env.FAST_DEMO_MODE !== "0";
 
 export async function POST(req: NextRequest) {
   const body = await req.json();
@@ -50,7 +51,7 @@ async function runAnalysis(jobId: string, username: string, claimsText: string):
           progress: 15 + (i + 1) * 15,
           message: `Indexed ${repo.name}...`,
         });
-        await pollIndexStatus(indexId);
+        await pollIndexStatus(indexId, FAST_DEMO_MODE ? 9_000 : 60_000);
         updateJob(jobId, {
           progress: 30 + (i + 1) * 10,
           message: `${repo.name} ready.`,
@@ -64,7 +65,7 @@ async function runAnalysis(jobId: string, username: string, claimsText: string):
 
   // 3. Parse claims
   updateJob(jobId, { stage: "analyzing", progress: 55, message: "Parsing claims..." });
-  const parsedClaims = await parseClaims(claimsText);
+  const parsedClaims = (await parseClaims(claimsText)).slice(0, FAST_DEMO_MODE ? 2 : 3);
 
   // 4. Verify each claim with agentic loop
   const repoMetas = repos.map((r) => ({
@@ -77,7 +78,7 @@ async function runAnalysis(jobId: string, username: string, claimsText: string):
   // Pre-pass: query Nia for every indexed repo so all show ✓ and the
   // agent has Nia's view of every repo before it starts reasoning.
   const niaUsed = { queried: new Set<string>() };
-  if (Object.keys(indexIds).length > 0) {
+  if (!FAST_DEMO_MODE && Object.keys(indexIds).length > 0) {
     updateJob(jobId, { progress: 50, message: "Briefing Nia on every repo..." });
     const briefingQuery =
       `Considering these claims about the developer: ${parsedClaims.map((c) => `"${c}"`).join("; ")}. ` +

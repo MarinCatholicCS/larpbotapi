@@ -458,7 +458,7 @@ def _select_relevant_repos(username: str, pool: list[dict], claims: list[str]) -
             raise ValueError("not a list")
         # Map names back to repo objects, preserving model order
         by_name = {r["name"]: r for r in pool}
-        selected = [by_name[n] for n in chosen_names if n in by_name][:5]
+        selected = [by_name[n] for n in chosen_names if n in by_name][:3]
         return selected if selected else _fallback_top(pool)
     except Exception as e:
         print(f"Repo selection LLM failed: {e}; falling back to stars")
@@ -477,7 +477,7 @@ def _fallback_top(pool: list[dict]) -> list[dict]:
     timeout=300,
 )
 def index_github_repos(github_username: str, claims: Optional[list[str]] = None) -> dict[str, str]:
-    """Returns {repo_name: 'owner/repo'} for up to 5 indexed repos.
+    """Returns {repo_name: 'owner/repo'} for up to 3 relevant repos.
 
     If `claims` are provided, asks GPT to pick the 3-5 most relevant repos from
     the top 10 candidates (skips GitHub Pages sites, tutorial-looking repos).
@@ -512,23 +512,25 @@ def index_github_repos(github_username: str, claims: Optional[list[str]] = None)
 
     # repo_name -> "owner/repo" slug (used by Nia search later)
     indexed: dict[str, str] = {}
-    pending_ids: dict[str, str] = {}  # source_id -> repo_name (for polling)
+    pending_ids: dict[str, str] = {}  # source_id -> repo_name (for brief polling)
 
     for repo in repos:
         slug = repo["full_name"]  # "owner/repo"
+        # Return the repo slug even if Nia is slow/unavailable. GitHub evidence
+        # is enough for the fast demo path, and this keeps verification moving.
+        indexed[repo["name"]] = slug
         try:
             r = requests.post(
                 f"{NIA_API}/sources",
                 headers=_nia_headers(),
                 json={"type": "repository", "repository": slug},
-                timeout=15,
+                timeout=4,
             )
             if not r.ok:
                 continue
             data = r.json()
             source_id = data.get("id")
             status = data.get("status", "")
-            indexed[repo["name"]] = slug
             if status not in ("indexed", "ready", "completed", "complete"):
                 pending_ids[source_id] = repo["name"]
         except Exception as e:
@@ -538,8 +540,9 @@ def index_github_repos(github_username: str, claims: Optional[list[str]] = None)
     if not pending_ids:
         return indexed
 
-    # Poll until all ready (max 60s — typical small-repo indexing is ~5-15s)
-    deadline = time.time() + 60
+    # Poll briefly. Nia can keep indexing in the background; the demo should
+    # not block for a minute before GitHub-backed verification starts.
+    deadline = time.time() + 9
     while pending_ids and time.time() < deadline:
         time.sleep(3)
         done = []
@@ -564,8 +567,9 @@ def index_github_repos(github_username: str, claims: Optional[list[str]] = None)
 # ---------------------------------------------------------------------------
 
 GITHUB_API = "https://api.github.com"
-MAX_TOOL_CALLS = 4
-MAX_CLAIMS = 3
+MAX_TOOL_CALLS = 2
+MAX_CLAIMS = 2
+FAST_DEMO_MODE = os.environ.get("FAST_DEMO_MODE", "1") != "0"
 
 
 def _gh_headers() -> dict:
@@ -642,6 +646,147 @@ def _nia_query(repo_slug: str, query: str) -> dict:
     }
 
 
+def _fetch_repo_snapshot(repo: dict, limit_paths: int = 80, limit_commits: int = 6) -> dict:
+    """Small GitHub-only evidence bundle for fast demo verification."""
+    name = repo.get("name", "")
+    full = repo.get("full_name", "")
+    snapshot = {
+        "name": name,
+        "fullName": full,
+        "url": repo.get("html_url", f"https://github.com/{full}"),
+        "language": repo.get("language"),
+        "description": repo.get("description"),
+        "stars": repo.get("stargazers_count", 0),
+        "pushedAt": repo.get("pushed_at"),
+        "paths": [],
+        "commits": [],
+    }
+    if not full:
+        return snapshot
+
+    try:
+        tree = requests.get(
+            f"{GITHUB_API}/repos/{full}/git/trees/HEAD",
+            headers=_gh_headers(),
+            params={"recursive": "1"},
+            timeout=8,
+        )
+        if tree.ok:
+            paths = [
+                f["path"] for f in tree.json().get("tree", [])
+                if f.get("type") == "blob"
+            ]
+            snapshot["paths"] = paths[:limit_paths]
+    except Exception:
+        pass
+
+    try:
+        commits = requests.get(
+            f"{GITHUB_API}/repos/{full}/commits",
+            headers=_gh_headers(),
+            params={"per_page": limit_commits},
+            timeout=8,
+        )
+        if commits.ok:
+            snapshot["commits"] = [
+                {
+                    "sha": c.get("sha", "")[:7],
+                    "date": (c.get("commit", {}).get("committer", {}).get("date") or "")[:10],
+                    "message": (c.get("commit", {}).get("message") or "").splitlines()[0][:120],
+                    "url": c.get("html_url", ""),
+                }
+                for c in commits.json()[:limit_commits]
+            ]
+    except Exception:
+        pass
+
+    return snapshot
+
+
+def _fast_verify_claims(
+    github_username: str,
+    claims: list[str],
+    all_repos: list[dict],
+    repo_names: list[str],
+    repo_full_names: dict[str, str],
+) -> dict:
+    """One-pass verifier for hackathon demos. Avoids the slow per-claim tool loop."""
+    from openai import OpenAI
+    client = OpenAI()
+
+    snapshots = [_fetch_repo_snapshot(r) for r in all_repos[:3]]
+    evidence_json = json.dumps(snapshots, ensure_ascii=False)[:18000]
+    claims_json = json.dumps(claims[:MAX_CLAIMS], ensure_ascii=False)
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        max_tokens=2200,
+        messages=[{
+            "role": "user",
+            "content": (
+                "You are LARPbot. Produce a fast but evidence-grounded candidate verification report.\n"
+                "Use only the GitHub evidence bundle: repo metadata, file paths, and recent commits. "
+                "Do not invent file contents. If evidence is weak, mark claims PARTIAL or UNVERIFIED.\n\n"
+                f"GitHub user: {github_username}\n"
+                f"Claims: {claims_json}\n"
+                f"Evidence bundle: {evidence_json}\n\n"
+                "Return ONLY valid JSON with this exact shape:\n"
+                '{"candidate":"<username>","githubUrl":"<url>","analyzedRepos":["repo"],'
+                '"overallLarpScore":<0-100>,"overallVerdict":"<one sentence>",'
+                '"subscores":{"skillInflation":<0-100>,"projectSubstance":<0-100>,'
+                '"roleAuthenticity":<0-100>,"codeDepth":<0-100>},'
+                '"claims":[{"claim":"<claim>","verdict":"VERIFIED|PARTIAL|UNVERIFIED|CONTRADICTED",'
+                '"confidence":<0-1>,"summary":"<finding>","evidence":"<specific evidence from paths/commits>",'
+                '"receipts":[{"type":"commit|file|repo|pattern","label":"<label>","detail":"<detail>",'
+                '"url":"https://github.com/<owner>/<repo>"}],"whatToAskNext":"<question>"}],'
+                '"redemption":"<positive>"}'
+            ),
+        }],
+    )
+
+    try:
+        result = json.loads(_strip_json(resp.choices[0].message.content.strip()))
+    except Exception:
+        result = {
+            "candidate": github_username,
+            "githubUrl": f"https://github.com/{github_username}",
+            "analyzedRepos": repo_names,
+            "overallLarpScore": 50,
+            "overallVerdict": "The fast analysis found some public code but needs interview follow-up.",
+            "subscores": {"skillInflation": 50, "projectSubstance": 50, "roleAuthenticity": 50, "codeDepth": 50},
+            "claims": [_fallback_claim(c) for c in claims],
+            "redemption": "The candidate has public repositories that can be discussed live.",
+        }
+
+    fixed_claims = []
+    for c in result.get("claims", []):
+        fixed_claims.append({
+            **c,
+            "receipts": _fix_receipt_urls(c.get("receipts", []), github_username, repo_full_names),
+        })
+
+    return {
+        "candidate": github_username,
+        "githubUrl": f"https://github.com/{github_username}",
+        "analyzedRepos": result.get("analyzedRepos") or repo_names,
+        "overallLarpScore": result.get("overallLarpScore", 50),
+        "overallVerdict": result.get("overallVerdict", "Fast analysis complete."),
+        "subscores": result.get("subscores") or {
+            "skillInflation": 50,
+            "projectSubstance": 50,
+            "roleAuthenticity": 50,
+            "codeDepth": 50,
+        },
+        "claims": fixed_claims or [_fallback_claim(c) for c in claims],
+        "redemption": result.get("redemption", "The candidate has public code worth reviewing live."),
+        "recentActivity": _fetch_recent_activity(all_repos[:3], limit_per_repo=5),
+        "niaVerified": False,
+        "niaQueriedRepos": [],
+        "niaIndexedRepos": list(repo_full_names.values()),
+        "analyzedAt": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+    }
+
+
 @function(
     description="Run agentic claim verification loop for one candidate",
     image=AGENT_IMAGE,
@@ -673,6 +818,15 @@ def verify_claims(github_username: str, claims: list[str], index_ids: dict[str, 
     repo_names = list(index_ids.keys())
     repo_full_names = dict(index_ids)  # name -> "owner/repo" slug
     all_repos = [full_metadata[n] for n in repo_names if n in full_metadata]
+
+    if FAST_DEMO_MODE:
+        return _fast_verify_claims(
+            github_username,
+            claims,
+            all_repos,
+            repo_names,
+            repo_full_names,
+        )
 
     tools = [
         {

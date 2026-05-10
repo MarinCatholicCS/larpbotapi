@@ -14,6 +14,7 @@ interface ThreadSummary {
   reportScore: number | null;
   reportSubject: string | null;
   reportText: string | null;
+  reportHtml: string | null;
   hasReport: boolean;
 }
 
@@ -81,41 +82,15 @@ function extractBody(payload: GmailPayload | null | undefined): string {
   return parts.map((part) => extractBody(part)).filter(Boolean).join("\n");
 }
 
-function cleanName(name: string): string {
-  return name
-    .replace(/^["']|["']$/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function nameFromEmailAddress(email: string): string {
-  const local = email.split("@")[0] || email;
-  return cleanName(
-    local
-      .replace(/[._-]+/g, " ")
-      .replace(/\b\w/g, (c) => c.toUpperCase())
-  );
-}
-
-function extractApplicantName(body: string, fallbackName: string, fallbackEmail: string): string {
-  const text = body.replace(/\s+/g, " ").trim();
-  const patterns = [
-    /\bmy name is\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\b/i,
-    /\bi am\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\b/i,
-    /\bi'm\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\b/i,
-    /\bthis is\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\b/i,
-  ];
-
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match?.[1]) return cleanName(match[1]);
+function extractHtml(payload: GmailPayload | null | undefined): string {
+  if (!payload) return "";
+  if (payload.mimeType === "text/html" && payload.body?.data) {
+    return decodePart(payload.body.data);
   }
-
-  const trimmedFallback = cleanName(fallbackName);
-  if (trimmedFallback && trimmedFallback !== fallbackEmail && !trimmedFallback.includes("@")) {
-    return trimmedFallback;
-  }
-  return nameFromEmailAddress(fallbackEmail);
+  const parts = payload.parts || [];
+  const html = parts.find((part) => part.mimeType === "text/html" && part.body?.data);
+  if (html?.body?.data) return decodePart(html.body.data);
+  return parts.map((part) => extractHtml(part)).find(Boolean) || "";
 }
 
 function extractReportInfo(subject: string): { username: string | null; score: number | null } {
@@ -166,8 +141,7 @@ export async function GET() {
         const { email: fromEmail, name: headerName } = extractEmail(firstFrom);
         const subject = firstHeaders.find((h) => h.name === "Subject")?.value || "(no subject)";
         const date = firstHeaders.find((h) => h.name === "Date")?.value || "";
-        const firstBody = extractBody(messages[0].payload);
-        const fromName = extractApplicantName(firstBody || messages[0].snippet || "", headerName, fromEmail);
+        const fromName = headerName || fromEmail;
 
         // Find a github URL anywhere in the thread. Report subjects are also
         // scanned because the applicant's original snippet can omit the URL.
@@ -175,6 +149,7 @@ export async function GET() {
         let reportScore: number | null = null;
         let reportSubject: string | null = null;
         let reportText: string | null = null;
+        let reportHtml: string | null = null;
         let hasReport = false;
         for (const msg of messages) {
           const headers = msg.payload?.headers || [];
@@ -187,6 +162,7 @@ export async function GET() {
             reportScore = reportScore ?? info.score;
             reportSubject = reportSubject || subj;
             reportText = reportText || extractBody(msg.payload);
+            reportHtml = reportHtml || extractHtml(msg.payload) || null;
           }
           if (!githubUsername) {
             const text = `${msg.snippet || ""} ${subj} ${extractBody(msg.payload)}`;
@@ -205,6 +181,7 @@ export async function GET() {
           reportScore,
           reportSubject,
           reportText,
+          reportHtml,
           hasReport,
         });
       } catch {

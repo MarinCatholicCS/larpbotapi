@@ -51,10 +51,8 @@ export async function GET() {
     const candidates = unwrapTensorlakeOutput(await invokeTensorlake("query_candidates", null));
     return NextResponse.json(candidates);
   } catch (err) {
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Unknown error" },
-      { status: 500 }
-    );
+    console.error("Tensorlake candidate list unavailable:", err);
+    return NextResponse.json([]);
   }
 }
 
@@ -67,12 +65,12 @@ export async function POST(req: NextRequest) {
   }
   try {
     const result = unwrapTensorlakeOutput(await invokeTensorlake("get_candidate", githubUsername));
-    if (!result) return NextResponse.json({ error: "Candidate not found" }, { status: 404 });
+    if (!result) return NextResponse.json({ error: "Candidate not found" });
     return NextResponse.json(result);
   } catch (err) {
+    console.error(`Tensorlake candidate ${githubUsername} unavailable:`, err);
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Unknown error" },
-      { status: 500 }
     );
   }
 }
