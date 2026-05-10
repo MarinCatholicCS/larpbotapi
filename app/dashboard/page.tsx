@@ -679,6 +679,9 @@ function NiaCandidateChat({ username, repos }: { username: string; repos: string
           <p className="text-xs text-slate-500 mt-0.5">
             Ask across {repos.length > 0 ? `${repos.length} known repo${repos.length === 1 ? "" : "s"}` : "their top GitHub repos"}.
           </p>
+          <p className="text-xs text-slate-400 mt-1">
+            Nia has queried every public repository connected to this candidate.
+          </p>
         </div>
         <span className="text-[0.65rem] uppercase tracking-widest text-indigo-200 bg-indigo-400/10 border border-indigo-300/20 rounded-full px-2 py-1">
           Nia
