@@ -115,8 +115,7 @@ export default function Landing() {
 
   const headingA = (
     <h1
-      className="text-5xl md:text-6xl font-black tracking-tight text-white leading-[1.08] text-center"
-      style={{ fontFamily: "var(--font-orbitron)" }}
+      className="text-5xl md:text-6xl font-semibold tracking-tight text-white leading-[1.08] text-center"
     >
       Stop hiring{" "}
       <span className="text-transparent bg-clip-text bg-gradient-to-r from-sky-400 to-violet-400">
@@ -128,8 +127,7 @@ export default function Landing() {
 
   const headingB = (
     <h1
-      className="text-5xl md:text-6xl font-black tracking-tight text-white leading-[1.08] text-center"
-      style={{ fontFamily: "var(--font-orbitron)" }}
+      className="text-5xl md:text-6xl font-semibold tracking-tight text-white leading-[1.08] text-center"
     >
       How it works
     </h1>
@@ -143,7 +141,6 @@ export default function Landing() {
       >
         <div
           className="flex-1 px-6 py-5 text-base text-slate-400 text-left"
-          style={{ fontFamily: "var(--font-inconsolata)" }}
         >
           tungtungrecruiting@gmail.com
         </div>
@@ -163,7 +160,6 @@ export default function Landing() {
       evidence report you can act on.
       <span
         className="block mt-4 text-slate-500 italic text-base"
-        style={{ fontFamily: "var(--font-edu-cursive)" }}
       >
         The antidote to inflated profiles and AI-generated résumés.
       </span>
@@ -173,7 +169,6 @@ export default function Landing() {
   return (
     <div
       className="h-screen overflow-hidden bg-slate-900 text-white flex flex-col"
-      style={{ fontFamily: "var(--font-rationale)" }}
     >
       <svg className="absolute w-0 h-0" aria-hidden="true">
         <defs>
@@ -189,8 +184,7 @@ export default function Landing() {
 
       <nav className="relative z-30 flex items-center justify-between px-8 py-5 border-b border-slate-800/60 flex-shrink-0">
         <span
-          className="text-lg font-bold tracking-tight"
-          style={{ fontFamily: "var(--font-orbitron)" }}
+          className="text-lg font-semibold tracking-tight"
         >
           <span className="text-transparent bg-clip-text bg-gradient-to-r from-sky-400 to-violet-400">
             LARP

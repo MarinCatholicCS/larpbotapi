@@ -27,10 +27,28 @@ async function invokeTensorlake(app: string, body: unknown) {
   throw new Error("Tensorlake query timed out");
 }
 
+function unwrapTensorlakeOutput(value: unknown): unknown {
+  if (
+    value &&
+    typeof value === "object" &&
+    "output" in value
+  ) {
+    return (value as { output: unknown }).output;
+  }
+  if (
+    value &&
+    typeof value === "object" &&
+    "result" in value
+  ) {
+    return (value as { result: unknown }).result;
+  }
+  return value;
+}
+
 // GET /api/candidates — list all analyzed candidates
-export async function GET(_req: NextRequest) {
+export async function GET() {
   try {
-    const candidates = await invokeTensorlake("query_candidates", null);
+    const candidates = unwrapTensorlakeOutput(await invokeTensorlake("query_candidates", null));
     return NextResponse.json(candidates);
   } catch (err) {
     return NextResponse.json(
@@ -48,7 +66,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "githubUsername required" }, { status: 400 });
   }
   try {
-    const result = await invokeTensorlake("get_candidate", githubUsername);
+    const result = unwrapTensorlakeOutput(await invokeTensorlake("get_candidate", githubUsername));
     if (!result) return NextResponse.json({ error: "Candidate not found" }, { status: 404 });
     return NextResponse.json(result);
   } catch (err) {
