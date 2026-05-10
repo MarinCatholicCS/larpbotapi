@@ -142,6 +142,49 @@ interface AskAnswer {
   citations: string[];
 }
 
+function compactNiaChatAnswer(answers: AskAnswer[]) {
+  const useful = answers.filter((answer) => answer.answer && answer.answer !== "(no answer)");
+  const joined = useful.map((answer) => answer.answer).join(" ");
+  const citations = Array.from(new Set(answers.flatMap((answer) => answer.citations || []))).slice(0, 5);
+  const reposWithEvidence = useful
+    .filter((answer) => (answer.citations || []).length > 0)
+    .map((answer) => answer.repo || answer.slug)
+    .slice(0, 3);
+
+  if (!joined) {
+    return {
+      content: "Nia found limited direct evidence for that question across the indexed repos.",
+      citations,
+    };
+  }
+
+  const lower = joined.toLowerCase();
+  const verdict = lower.includes("not find") || lower.includes("limited") || lower.includes("not enough")
+    ? "Nia found limited direct evidence for that claim."
+    : "Nia found supporting repo evidence for that question.";
+  const evidence = reposWithEvidence.length > 0
+    ? `Best evidence: ${reposWithEvidence.join(", ")}.`
+    : "Best evidence: repo structure and recent commits, but no single decisive file.";
+  const nextStep = lower.includes("rust")
+    ? "Ask them to explain a Rust-specific implementation live."
+    : "Use the links below for the fastest follow-up.";
+
+  return {
+    content: `${verdict}\n${evidence}\n${nextStep}`,
+    citations,
+  };
+}
+
+function evidenceLabel(citation: string) {
+  const parts = citation.split("/blob/HEAD/");
+  if (parts.length === 2) {
+    const repo = parts[0].split("/").slice(-1)[0];
+    const file = parts[1].split("/").pop() || parts[1];
+    return `${repo}: ${file}`;
+  }
+  return citation.split("/").slice(-2).join("/");
+}
+
 function mergeData(candidates: CandidateRow[], threads: InboxThread[]): MergedRow[] {
   const candidatesByUser = new Map(
     candidates.map((candidate) => [candidate.github_username.toLowerCase(), candidate])
@@ -646,19 +689,13 @@ function NiaCandidateChat({ username, repos }: { username: string; repos: string
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
-      const answers = (data.perRepo || []) as AskAnswer[];
-      const useful = answers.filter((answer) => answer.answer);
-      const lines = (useful.length > 0 ? useful : answers).map((answer) => {
-        const label = answer.repo || answer.slug;
-        return `${label}: ${answer.answer || "(no answer)"}`;
-      });
-      const citations = answers.flatMap((answer) => answer.citations || []);
+      const { content, citations } = compactNiaChatAnswer((data.perRepo || []) as AskAnswer[]);
 
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: lines.join("\n\n") || "I checked Nia's indexed candidate context, but there was not enough evidence to answer that confidently.",
+          content,
           citations,
         },
       ]);
@@ -714,7 +751,7 @@ function NiaCandidateChat({ username, repos }: { username: string; repos: string
                     rel="noopener noreferrer"
                     className="block text-xs text-sky-300 hover:text-sky-200"
                   >
-                    {citation}
+                    {evidenceLabel(citation)}
                   </a>
                 ))}
               </div>
